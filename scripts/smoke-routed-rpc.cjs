@@ -206,14 +206,18 @@ async function main() {
       params: [{ probe: 'direct-route' }],
       timeoutMs: 10000,
     });
-    if (!direct.ok || direct.result?.source !== 'mock-local-node' || direct.result?.method !== 'tl_getinfo') {
+    if (!direct.ok || direct.result?.source !== 'mock-local-node' || direct.result?.method !== 'tl_getSyncStatus') {
       throw new Error(`direct /rpc/route did not return mock result: ${JSON.stringify(direct)}`);
     }
 
     const compat = await postJson(`http://127.0.0.1:${port}/relayer/rpc/tl_getallbalancesforaddress`, {
       params: ['tltc1qsmokeaddress'],
     });
-    if (compat?.data?.source !== 'mock-local-node' || compat?.data?.method !== 'tl_getallbalancesforaddress') {
+    if (
+      compat?.data?.source !== 'mock-local-node' ||
+      compat?.data?.method !== 'tl_getAllBalancesForAddress' ||
+      compat?.data?.params !== 'tltc1qsmokeaddress'
+    ) {
       throw new Error(`compat /relayer/rpc route did not return mock result: ${JSON.stringify(compat)}`);
     }
 
@@ -225,6 +229,7 @@ async function main() {
       providerNodeId: advertised.provider.nodeId,
       directRoute: {
         ok: direct.ok,
+        requestedMethod: 'tl_getinfo',
         method: direct.result.method,
         providerNodeId: direct.providerNodeId,
       },
