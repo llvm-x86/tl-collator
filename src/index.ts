@@ -293,7 +293,13 @@ async function main() {
     });
   };
 
-  const proxyLegacyJson = async (method: string, pathname: string, body?: any, query?: Record<string, string>): Promise<{ statusCode: number; body: any }> => {
+  const proxyLegacyJson = async (
+    method: string,
+    pathname: string,
+    body?: any,
+    query?: Record<string, string>,
+    headers?: Record<string, string>,
+  ): Promise<{ statusCode: number; body: any }> => {
     const url = new URL(`${legacyRelayerBaseUrl}${pathname}`);
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -302,7 +308,7 @@ async function main() {
     }
     const res = await fetch(url, {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...(headers || {}) },
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body ?? {}),
     });
     return { statusCode: res.status, body: await readResponseBody(res) };
@@ -401,7 +407,12 @@ async function main() {
 
       if (u.pathname === '/attestation/ip') {
         try {
-          const proxied = await proxyLegacyJson(req.method || 'GET', '/attestation/ip');
+          const proxyHeaders: Record<string, string> = {};
+          for (const name of ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto']) {
+            const value = req.headers[name];
+            if (typeof value === 'string' && value.trim()) proxyHeaders[name] = value;
+          }
+          const proxied = await proxyLegacyJson(req.method || 'GET', '/attestation/ip', undefined, undefined, proxyHeaders);
           if (proxied.statusCode < 500) {
             writeJson(res, proxied.statusCode, proxied.body);
             return;
