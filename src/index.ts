@@ -19,6 +19,54 @@ import { IpIntelClient } from './ipIntel.js';
 import { AuditLog } from './auditLog.js';
 import { buildBitvmStatusFromArtifacts } from './bitvmStatus.js';
 
+const PUBLIC_RPC_METHODS = new Set([
+  'tl_getstatesnapshot',
+  'tl_watchonly_register',
+  'tl_watchonly_utxos',
+  'tl_getsyncstatus',
+  'tl_getallbalancesforaddress',
+  'tl_getchannel',
+  'tl_getchannelcolumn',
+  'tl_getcontractinfo',
+  'tl_getattestations',
+  'tl_gettransaction',
+  'tl_getclearlistbyid',
+  'tl_listcontractseries',
+  'tl_getinitmargin',
+  'tl_channelbalanceforcommiter',
+  'tl_getmaxsynth',
+  'tl_contractposition',
+  'tl_tokentradehistoryforaddress',
+  'tl_contracttradehistoryforaddress',
+  'tl_totaltradehistoryforaddress',
+  'tl_getinfo',
+  'tl_getbalance',
+  'tl_getproperty',
+  'tl_listproperties',
+  'tl_createpayload_attestation',
+  'tl_createpayload_commit_tochannel',
+  'tl_bitvmstatus',
+]);
+
+function normalizeRpcMethod(method: unknown): string {
+  return String(method || '').trim().toLowerCase();
+}
+
+function isPublicRpcMethod(method: unknown): boolean {
+  return PUBLIC_RPC_METHODS.has(normalizeRpcMethod(method));
+}
+
+function publicRpcError(id: string, code: string, message: string): RpcResponseV1 {
+  return { id, ok: false, error: { code, message } };
+}
+
+function configuredCorsOrigins(): string[] {
+  return String(process.env.TL_COLLATOR_CORS_ORIGINS || '')
+    .split(/[\n,]+/)
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
 function randId(): string {
   return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
 }
@@ -134,6 +182,9 @@ async function main() {
   const compatRpcService = process.env.TL_COLLATOR_RPC_SERVICE || 'tradelayer.rpc';
   const compatRpcNetwork = process.env.TL_COLLATOR_RPC_NETWORK || '';
   const rpcAdvertTtlMs = Math.max(15000, Number(process.env.TL_COLLATOR_RPC_ADVERT_TTL_MS || 45000) || 45000);
+  const corsOrigins = configuredCorsOrigins();
+  const isProduction = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+  const legacyTlProxyEnabled = !isProduction && String(process.env.TL_COLLATOR_ENABLE_LEGACY_TL_PROXY || '').trim() === '1';
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
     process.env.TL_WALLET_LISTENER_URL ||
@@ -213,11 +264,10 @@ async function main() {
       for (const service of advert.services) {
         if (service.service !== rpcReq.service) continue;
         if (rpcReq.network && service.network && service.network !== rpcReq.network) continue;
-        if (Array.isArray(service.methods) && service.methods.length) {
-          const requestedMethod = String(rpcReq.method || '').trim().toLowerCase();
-          const advertised = service.methods.map((method) => String(method || '').trim().toLowerCase());
-          if (!advertised.includes(requestedMethod)) continue;
-        }
+        if (!Array.isArray(service.methods) || service.methods.length === 0) continue;
+        const requestedMethod = normalizeRpcMethod(rpcReq.method);
+        const advertised = service.methods.map((method) => normalizeRpcMethod(method));
+        if (!advertised.includes(requestedMethod)) continue;
         return { session: sess, nodeId: advert.nodeId };
       }
     }
@@ -233,6 +283,16 @@ async function main() {
       requester: requester?.id || null,
       sourceEndpoint: rpcReq.sourceEndpoint || null,
     });
+    if (rpcReq.service !== compatRpcService) {
+      const res = publicRpcError(rpcReq.id, 'RPC_SERVICE_FORBIDDEN', 'RPC service is not available on the public mesh');
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    }
+    if (!isPublicRpcMethod(rpcReq.method)) {
+      const res = publicRpcError(rpcReq.id, 'RPC_METHOD_FORBIDDEN', 'RPC method is not available on the public mesh');
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    }
     const provider = findRpcProvider(rpcReq, requester);
     if (!provider) {
       logPortfolioHeartbeat('rpc', 'no-provider', {
@@ -325,6 +385,12 @@ async function main() {
   };
 
   const routeCompatRpcRequest = async (method: string, params: unknown[], replyPath: string): Promise<{ statusCode: number; body: any }> => {
+    if (!isPublicRpcMethod(method)) {
+      return {
+        statusCode: 403,
+        body: { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } },
+      };
+    }
     const rpcReq: RpcRequestV1 = {
       id: `rpc-${randId()}`,
       service: compatRpcService,
@@ -379,11 +445,22 @@ async function main() {
     void (async () => {
       const u = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
 
-      // Basic CORS for web clients.
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      const requestOrigin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+      const originAllowed = !!requestOrigin && corsOrigins.includes(requestOrigin);
+      const allowDevelopmentWildcard = !isProduction && corsOrigins.length === 0;
+      if (originAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+        res.setHeader('Vary', 'Origin');
+      } else if (allowDevelopmentWildcard) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      }
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'content-type');
       if (req.method === 'OPTIONS') {
+        if (requestOrigin && !originAllowed && !allowDevelopmentWildcard) {
+          writeJson(res, 403, { error: { code: 'CORS_ORIGIN_DENIED', message: 'Origin is not approved for this API' } });
+          return;
+        }
         res.statusCode = 204;
         res.end();
         return;
@@ -477,14 +554,15 @@ async function main() {
           return;
         }
 
-        try {
-          const body = req.method === 'GET' ? undefined : await readHttpJson(req, cfg.maxMsgBytes);
-          const proxied = await proxyLegacyJson(req.method || 'POST', u.pathname, body);
-          if (proxied.statusCode < 500) {
-            writeJson(res, proxied.statusCode, proxied.body);
-            return;
-          }
-        } catch {}
+        if (!legacyTlProxyEnabled) {
+          writeJson(res, 404, { error: { code: 'LEGACY_TL_PROXY_DISABLED', message: 'Legacy /tl_* proxy is disabled' } });
+          return;
+        }
+
+        const body = req.method === 'GET' ? undefined : await readHttpJson(req, cfg.maxMsgBytes);
+        const proxied = await proxyLegacyJson(req.method || 'POST', u.pathname, body);
+        writeJson(res, proxied.statusCode, proxied.body);
+        return;
       }
 
       const compatRpcMatch =
@@ -494,7 +572,11 @@ async function main() {
       if (req.method === 'POST' && compatRpcMatch) {
         const method = decodeURIComponent(compatRpcMatch[1] || '').trim();
         if (!method) {
-          writeJson(res, 400, { error: 'Missing RPC method' });
+          writeJson(res, 400, { error: { code: 'BAD_RPC_REQUEST', message: 'Missing RPC method' } });
+          return;
+        }
+        if (!isPublicRpcMethod(method)) {
+          writeJson(res, 403, { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
           return;
         }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
@@ -526,6 +608,14 @@ async function main() {
           writeJson(res, 400, { ok: false, error: { code: 'BAD_RPC_REQUEST', message: 'service and method are required' } });
           return;
         }
+        if (rpcReq.service !== compatRpcService) {
+          writeJson(res, 403, { ok: false, error: { code: 'RPC_SERVICE_FORBIDDEN', message: 'RPC service is not available on the public mesh' } });
+          return;
+        }
+        if (!isPublicRpcMethod(rpcReq.method)) {
+          writeJson(res, 403, { ok: false, error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
+          return;
+        }
         logPortfolioHeartbeat('http', '/rpc/route request', {
           service: rpcReq.service,
           method: rpcReq.method,
@@ -542,7 +632,7 @@ async function main() {
           errorCode: routed.error?.code || null,
           providerNodeId: routed.providerNodeId || null,
         });
-        writeJson(res, routed.ok ? 200 : 502, routed);
+        writeJson(res, routed.ok ? 200 : routed.error?.code === 'NO_RPC_PROVIDER' ? 503 : 502, routed);
         return;
       }
 
@@ -927,17 +1017,33 @@ async function main() {
               }
 
               if (wm.t === 'RPC_ADVERTISE') {
+                const services = wm.services.reduce<RpcServiceAdvertisementV1[]>((accepted, service) => {
+                  if (service.service !== compatRpcService || !Array.isArray(service.methods) || service.methods.length === 0) {
+                    return accepted;
+                  }
+                  const methods = Array.from(new Set(service.methods
+                    .map((method) => normalizeRpcMethod(method))
+                    .filter((method) => isPublicRpcMethod(method))));
+                  if (methods.length === 0) return accepted;
+                  accepted.push({ ...service, methods });
+                  return accepted;
+                }, []);
                 logPortfolioHeartbeat('rpc', 'advertise', {
                   nodeId: wm.nodeId,
-                  services: Array.isArray(wm.services) ? wm.services.map((service) => ({
+                  services: services.map((service) => ({
                     service: service.service,
                     network: service.network || null,
                     methods: Array.isArray(service.methods) ? service.methods.length : null,
-                  })) : [],
+                  })),
                 });
+                if (services.length === 0) {
+                  rpcAdvertisements.delete(sess);
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'RPC_ADVERTISEMENT_REJECTED', msg: 'advertise at least one supported public RPC method' });
+                  return;
+                }
                 rpcAdvertisements.set(sess, {
                   nodeId: wm.nodeId,
-                  services: wm.services,
+                  services,
                   lastSeenTs: Date.now(),
                 });
                 return;

@@ -119,7 +119,7 @@ function firstObjectOrValue(params) {
   return first && typeof first === 'object' && !Array.isArray(first) ? first : { value: first, values };
 }
 
-function listenerRequestFor(req, target, walletTarget = target) {
+function listenerRequestFor(req, target) {
   const method = String(req.method || '').trim();
   const normalized = method.toLowerCase();
   const params = asArray(req.params);
@@ -127,25 +127,6 @@ function listenerRequestFor(req, target, walletTarget = target) {
   const shaped = firstObjectOrValue(params);
 
   const post = (path, body) => ({ method: 'POST', url: `${target}/${path}`, body });
-  const walletRpc = (rpcMethod, nextParams = req.params) => ({
-    method: 'POST',
-    url: `${walletTarget}/rpc/${rpcMethod}`,
-    body: { params: nextParams == null ? [] : nextParams },
-    internalRelay: true,
-  });
-  const walletListUnspent = () => {
-    const minConfirmations = params[0] ?? 0;
-    const maxConfirmations = params[1] ?? 999999999;
-    const target = params[2];
-    const addresses = Array.isArray(target)
-      ? target
-      : target && typeof target === 'object' && target.address
-        ? [target.address]
-        : target == null
-          ? []
-          : [target];
-    return walletRpc('listunspent', [minConfirmations, maxConfirmations, addresses]);
-  };
   const get = (path, query) => {
     const url = new URL(`${target}/${path}`);
     for (const [key, value] of Object.entries(query || {})) {
@@ -155,12 +136,17 @@ function listenerRequestFor(req, target, walletTarget = target) {
   };
 
   const postMap = {
-    getaddressinfo: () => walletRpc('getaddressinfo'),
-    importpubkey: () => walletRpc('importpubkey'),
-    listunspent: () => walletListUnspent(),
-    getblockchaininfo: () => walletRpc('getblockchaininfo'),
-    validateaddress: () => walletRpc('validateaddress'),
     tl_getstatesnapshot: () => post('tl_getStateSnapshot', { label: shaped.label || shaped.value || undefined }),
+    tl_watchonly_register: () => post('tl_watchonly_register', {
+      address: shaped.address || params[0],
+      pubkey: shaped.pubkey || shaped.pubKey,
+      network: shaped.network,
+    }),
+    tl_watchonly_utxos: () => post('tl_watchonly_utxos', {
+      address: shaped.address || params[0],
+      pubkey: shaped.pubkey || shaped.pubKey,
+      network: shaped.network,
+    }),
     tl_getallbalancesforaddress: () => post('tl_getAllBalancesForAddress', { params: shaped.address || shaped.value }),
     tl_listproperties: () => post('tl_listProperties', {}),
     tl_getproperty: () => post('tl_getProperty', { params: shaped.propertyId || shaped.propid || shaped.id || shaped.value }),
@@ -222,7 +208,6 @@ function listenerRequestFor(req, target, walletTarget = target) {
 
 async function callUpstream(req) {
   const target = env('RPC_TARGET', 'http://127.0.0.1:3000').replace(/\/+$/, '');
-  const walletTarget = env('RPC_WALLET_TARGET', 'http://127.0.0.1:1986').replace(/\/+$/, '');
   const style = env('RPC_STYLE', 'path').toLowerCase();
   const user = process.env.RPC_USER;
   const pass = process.env.RPC_PASSWORD;
@@ -246,7 +231,7 @@ async function callUpstream(req) {
     return out ? out.result : null;
   }
 
-  const routed = listenerRequestFor(req, target, walletTarget);
+  const routed = listenerRequestFor(req, target);
   const routedHeaders = routed.internalRelay
     ? { ...headers, 'x-tradelayer-internal-relay': '1' }
     : headers;

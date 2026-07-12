@@ -94,6 +94,31 @@ function startMockRpc() {
       }
 
       const rpcMethod = String(req.url || '/').replace(/^\/+/, '').split('?')[0];
+      if (rpcMethod === 'tl_watchonly_register') {
+        writeJson(res, 200, {
+          address: body?.address,
+          pubkey: body?.pubkey,
+          network: body?.network,
+          registration: { status: 'registered', registeredAt: 1700000000000, importCount: 1 },
+        });
+        return;
+      }
+      if (rpcMethod === 'tl_watchonly_utxos') {
+        writeJson(res, 200, {
+          address: body?.address,
+          pubkey: body?.pubkey,
+          network: body?.network,
+          registration: { status: 'already-registered', registeredAt: 1700000000000, importCount: 1 },
+          snapshot: {
+            id: 'mock-watchonly-snapshot',
+            at: 1700000000001,
+            count: 1,
+            sourceBlock: { chain: 'test', height: 123456, headers: 123456, hash: 'a'.repeat(64) },
+          },
+          utxos: [{ txid: 'b'.repeat(64), vout: 1, amount: 1.25, scriptPubKey: '0014mock', confirmations: 6 }],
+        });
+        return;
+      }
       writeJson(res, 200, {
         source: 'mock-local-node',
         method: rpcMethod,
@@ -193,7 +218,7 @@ async function main() {
       RPC_SERVICE: service,
       RPC_NETWORK: network,
       RPC_STYLE: 'path',
-      RPC_METHODS_JSON: JSON.stringify(['tl_getinfo', 'getblockchaininfo', 'tl_getallbalancesforaddress']),
+      RPC_METHODS_JSON: JSON.stringify(['tl_getinfo', 'tl_getallbalancesforaddress', 'tl_watchonly_register', 'tl_watchonly_utxos']),
       ICE_SERVERS_JSON: '[]',
     });
 
@@ -221,6 +246,35 @@ async function main() {
       throw new Error(`compat /relayer/rpc route did not return mock result: ${JSON.stringify(compat)}`);
     }
 
+    const watchOnlyAccount = {
+      address: 'tltc1qsmokeaddress',
+      pubkey: '02' + '11'.repeat(32),
+      network: 'testnet',
+    };
+    const registration = await postJson(`http://127.0.0.1:${port}/rpc/route`, {
+      service,
+      network,
+      method: 'tl_watchonly_register',
+      params: [watchOnlyAccount],
+    });
+    if (!registration.ok || registration.result?.registration?.status !== 'registered') {
+      throw new Error(`watch-only registration did not return the scoped mock result: ${JSON.stringify(registration)}`);
+    }
+
+    const snapshot = await postJson(`http://127.0.0.1:${port}/rpc/route`, {
+      service,
+      network,
+      method: 'tl_watchonly_utxos',
+      params: [watchOnlyAccount],
+    });
+    if (
+      !snapshot.ok ||
+      snapshot.result?.snapshot?.sourceBlock?.height !== 123456 ||
+      snapshot.result?.utxos?.[0]?.txid !== 'b'.repeat(64)
+    ) {
+      throw new Error(`watch-only UTXO snapshot did not return canonical fields: ${JSON.stringify(snapshot)}`);
+    }
+
     console.log(JSON.stringify({
       ok: true,
       collator: `http://127.0.0.1:${port}`,
@@ -236,6 +290,11 @@ async function main() {
       compatRoute: {
         method: compat.data.method,
         params: compat.data.params,
+      },
+      watchOnly: {
+        registration: registration.result.registration.status,
+        snapshotHeight: snapshot.result.snapshot.sourceBlock.height,
+        utxoCount: snapshot.result.utxos.length,
       },
       mockCalls: mock.calls,
     }, null, 2));
