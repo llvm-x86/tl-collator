@@ -47,6 +47,10 @@ for (const needle of [
   "code: 'RPC_METHOD_FORBIDDEN'",
   "'tl_watchonly_register'",
   "'tl_watchonly_utxos'",
+  "'/tx/buildUnsigned'",
+  "'/tx/buildunsigned'",
+  "'/tx/build-unsigned'",
+  "proxyLegacyJson('POST', u.pathname, body)",
 ]) {
   if (!collator.includes(needle)) throw new Error(`Collator policy missing: ${needle}`);
 }

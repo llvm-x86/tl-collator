@@ -819,10 +819,13 @@ async function main() {
         return;
       }
 
-      if (req.method === 'POST' && u.pathname === '/tx/buildTx') {
+      if (
+        req.method === 'POST'
+        && ['/tx/buildTx', '/tx/buildUnsigned', '/tx/buildunsigned', '/tx/build-unsigned'].includes(u.pathname)
+      ) {
         const body = await readHttpJson(req, cfg.maxMsgBytes);
         try {
-          const proxied = await proxyLegacyJson('POST', '/tx/buildTx', body);
+          const proxied = await proxyLegacyJson('POST', u.pathname, body);
           if (proxied.statusCode < 500) {
             writeJson(res, proxied.statusCode, proxied.body);
             return;
