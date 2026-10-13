@@ -9,11 +9,10 @@ function usage() {
   console.log(
     [
       'Usage:',
-      '  node scripts/sign-infra-attestation.cjs \\',
+      '  ADMIN_KEY_FILE=/path/to/admin.key node scripts/sign-infra-attestation.cjs \\',
       '    --ws ws://127.0.0.1:8787/ws \\',
       '    --clearlist-id 42 \\',
       '    --admin-pubkey <hex-compressed-pubkey> \\',
-      '    --admin-privkey <hex-privkey> \\',
       '    [--collator-key ./data/collator.key] \\',
       '    [--issued-at 1760000000] \\',
       '    [--expires-at 1762592000] \\',
@@ -21,6 +20,11 @@ function usage() {
       '    [--nonce <hex>] \\',
       '    [--kind COLLATOR_APPROVAL|BUNDLER_APPROVAL] \\',
       '    [--out ./data/infra-attestations.json]',
+      '',
+      'Admin private key sources (first match wins):',
+      '  1. ADMIN_KEY_FILE env var: path to a file containing the 32-byte hex key',
+      '  2. ADMIN_KEY env var: raw 32-byte hex key (or a file path)',
+      '  3. --admin-privkey <hex|path>: DEPRECATED, exposed via ps/shell history',
       '',
       'Notes:',
       '  - If --out exists, the attestation is upserted by (ws, clearlistId, infraId).',
@@ -87,6 +91,24 @@ function readPubHex(rawOrPath) {
   return fileData.toLowerCase();
 }
 
+// L2: prefer the admin private key from env/file; the CLI argument remains as a
+// deprecated fallback so existing usage keeps working (with a warning).
+function resolveAdminPrivKey(args) {
+  const envKeyFile = String(process.env.ADMIN_KEY_FILE || '').trim();
+  if (envKeyFile) return readPrivHex(envKeyFile);
+  const envKey = String(process.env.ADMIN_KEY || '').trim();
+  if (envKey) return readPrivHex(envKey);
+  const cliKey = args['admin-privkey'];
+  if (typeof cliKey === 'string' && cliKey.trim()) {
+    console.error(
+      'WARNING: --admin-privkey on the command line is deprecated (visible in ps/shell history). ' +
+      'Set ADMIN_KEY_FILE=/path/to/admin.key (or ADMIN_KEY=<hex>) instead.'
+    );
+    return readPrivHex(cliKey);
+  }
+  throw new Error('missing admin private key: set ADMIN_KEY_FILE (path) or ADMIN_KEY (hex); --admin-privkey is a deprecated fallback');
+}
+
 function main() {
   const args = parseArgs(process.argv);
   if (args.help || args.h) {
@@ -111,7 +133,7 @@ function main() {
   const infraId = sha256HexUtf8(infraPubKey);
 
   const adminPubKey = readPubHex(args['admin-pubkey']);
-  const adminPrivKey = readPrivHex(args['admin-privkey']);
+  const adminPrivKey = resolveAdminPrivKey(args);
 
   const issuedAt = Number.isFinite(Number(args['issued-at']))
     ? Number(args['issued-at'])

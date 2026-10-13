@@ -51,6 +51,20 @@ for (const needle of [
   "'/tx/buildunsigned'",
   "'/tx/build-unsigned'",
   "proxyLegacyJson('POST', u.pathname, body)",
+  // Security batch 1 (issue #1): legacy proxy master switch + faucet opt-in (H2),
+  // trusted-proxy gating for client IP headers (H1), orderId binding (C1),
+  // RPC_RES provider binding and pending-RPC caps (C2).
+  'LEGACY_PROXY_ENABLED',
+  "code: 'LEGACY_PROXY_DISABLED'",
+  'LEGACY_PROXY_FAUCET',
+  "code: 'LEGACY_PROXY_FAUCET_DISABLED'",
+  'TRUST_PROXY',
+  'net.isIP(ip)',
+  'computeOrderId(order.body, order.traderPubKey, order.clientNonce)',
+  "code: 'bad_order_id'",
+  'settleRpcResponse(wm.res, sess)',
+  'pending.provider !== sender',
+  'pendingRpc.size >= pendingRpcMax',
 ]) {
   if (!collator.includes(needle)) throw new Error(`Collator policy missing: ${needle}`);
 }

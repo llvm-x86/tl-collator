@@ -11,7 +11,7 @@
     },
     "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef",
-    "expectedOrderId": "REPLACE_ME"
+    "expectedOrderId": "b5c838846680e61c59dc583b7597034869f121cfc29ec19c5765dc931e492025"
   },
   "tapeTest": {
     "entryNoSig": {
@@ -34,12 +34,12 @@
         },
         "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef",
-        "orderId": "REPLACE_ME",
+        "orderId": "b5c838846680e61c59dc583b7597034869f121cfc29ec19c5765dc931e492025",
         "sigTrader": "00"
       }
     },
-    "expectedEntryHash": "REPLACE_ME",
-    "expectedSigPayloadHash": "REPLACE_ME"
+    "expectedEntryHash": "270702d95819b9ae5b5d8ca97e6371f38d143d6ecba9037ece4083e7ae7139f2",
+    "expectedSigPayloadHash": "d8d10c498452b5970950d9600eec8b48d5385e47571cb4801ce9fc901068a1fa"
   }
 }
 

@@ -94,6 +94,9 @@ export function loadConfig(): Config {
   const submitBurst = intEnv('SUBMIT_BURST', intEnv('SUBMIT_BURST', 10));
   const submitRatePerSec = intEnv('SUBMIT_RPS', intEnv('SUBMIT_RATE_PER_SEC', 2));
 
+  // H3b: sane default connection cap; CONN_MAX=0 explicitly disables the cap.
+  const connMaxConfigured = intEnv('CONN_MAX', 256);
+
   return {
     port: intEnv('PORT', intEnv('SERVER_PORT', 8787)),
     wsPath: process.env.WS_PATH || '/ws',
@@ -120,7 +123,7 @@ export function loadConfig(): Config {
     asnBlocklist,
     ipIntelUrl,
     ipIntelTtlSec,
-    connMax: process.env.CONN_MAX ? intEnv('CONN_MAX', 0) : null,
+    connMax: connMaxConfigured > 0 ? connMaxConfigured : null,
     tlsKeyPath: process.env.TLS_KEY_PATH || null,
     tlsCertPath: process.env.TLS_CERT_PATH || null,
     iceServers,

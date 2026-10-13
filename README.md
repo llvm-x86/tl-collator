@@ -54,6 +54,28 @@ keep working without changing its base URL:
 - `GET /token/list`
 - `GET /token/:propid`
 
+Note: all legacy relayer proxy routes are **disabled by default** and require
+`LEGACY_PROXY_ENABLED=1` (see Configure). Routes that have a WebRTC-routed RPC
+fallback transparently use the allowlisted routed path while the proxy is off.
+
+## Order submission and `orderId` derivation
+
+`SUBMIT` envelopes must follow the TL-Canon v1 derivation rule (see
+`spec/schemas/tl-canon-v1.md`):
+
+```
+orderId   = sha256(stableStringify(body) + traderPubKey + clientNonce)   (lowercase hex)
+sigTrader = secp256k1 compact signature (64 bytes hex) over the 32 raw bytes of orderId
+```
+
+The collator verifies `sigTrader` over `orderId` **and** rejects any envelope
+whose `orderId` does not match the canonical derivation (`ERR` code
+`bad_order_id`). This binds the trader signature to the order content, so a
+harvested `(orderId, sigTrader, traderPubKey)` triple can never be replayed
+with a different `body`. Clients that computed `orderId` differently must adopt
+this convention (identical to `scripts/smoke-live-flow.cjs`). Worked test
+vectors: `spec/test-vectors.json` (checked by `npm test`).
+
 ## Configure
 
 Environment variables:
@@ -70,7 +92,7 @@ Environment variables:
 - `SUBMIT_BURST` (default: `10`) and `SUBMIT_RPS` (default: `2`) (also accepts legacy `SUBMIT_RATE_PER_SEC`)
 - `SEEN_ORDERIDS_MAX` (default: `100000`)
 - `NAME`, `OPERATOR`, `REGION` (optional manifest fields)
-- `CONN_MAX` (optional hard cap on concurrent WS connections)
+- `CONN_MAX` (hard cap on concurrent WS connections, default `256`; set `0` to disable the cap)
 - `CLEARLIST_ENFORCE` (`0|1`, default `0`)
 - `CLEARLIST_URL` (required if `CLEARLIST_ENFORCE=1`; expects `POST /clearlist/check`)
 - `CLEARLIST_FAIL_MODE` (`closed|open`, default `closed`)
@@ -83,7 +105,20 @@ Environment variables:
 - `ICE_SERVERS_JSON` (default: a couple public STUN servers)
 - `TL_RELAY_COMPAT_UPSTREAM_URL` (legacy relayer upstream, defaults to `http://127.0.0.1:3000`)
 - `TL_WALLET_LISTENER_URL` is also honored as the upstream fallback for legacy listener routes
+- `LEGACY_PROXY_ENABLED` (`0|1`, default `0`): master switch for all legacy relayer proxy routes (`/address/*`, `/tx/*`, `/token/*`, `/chain/info`, `/rpc/:method` fallback, `/attestation/ip` forwarding, `/tl_*`). Off by default because these paths bypass the public RPC allowlist. Enable only for a trusted local relayer.
+- `LEGACY_PROXY_FAUCET` (`0|1`, default `0`): additionally required to proxy `GET /address/faucet/:address`. This is a fund-moving endpoint — never enable it on an untrusted network.
+- `TRUST_PROXY` (`0|1`, default `0`): only trust `cf-connecting-ip`/`x-real-ip`/`x-forwarded-for` headers when deployed behind a trusted proxy. Off by default so the socket peer address is used and IP headers cannot be spoofed for `/attestation/ip`.
+- `PENDING_RPC_MAX` (default `1000`): cap on concurrent in-flight routed RPC requests.
 - `TL_COLLATOR_RPC_SERVICE` / `TL_COLLATOR_RPC_NETWORK` tune routed RPC matching
+
+### Security defaults
+
+- Legacy relayer proxy is **disabled** unless `LEGACY_PROXY_ENABLED=1`; the faucet path additionally requires `LEGACY_PROXY_FAUCET=1`.
+- Client IP is taken from the socket unless `TRUST_PROXY=1`; determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
+- Concurrent WS connections are capped by `CONN_MAX` (default `256`).
+- Each `SIGNAL_OFFER` closes/replaces the session's previous `RTCPeerConnection`; `TAPE_SUB` full re-reads are rate-limited to one per second per session.
+- `RPC_RES` is only accepted from the session the request was routed to; pending routed RPCs are namespaced per provider session and capped by `PENDING_RPC_MAX`.
+- The generated collator key file is written with mode `0600`.
 
 Infra attestations (optional; used by wallets for curated-mode acceptability):
 
@@ -93,15 +128,19 @@ Infra attestations (optional; used by wallets for curated-mode acceptability):
 Generate/sign attestation entries:
 
 ```powershell
+$env:ADMIN_KEY_FILE = "./data/admin.key"   # file with the 32-byte hex admin private key
 npm run infra:sign -- `
   --ws ws://127.0.0.1:8787/ws `
   --clearlist-id 42 `
   --admin-pubkey 02... `
-  --admin-privkey <admin-privkey-hex> `
   --collator-key ./data/collator.key `
   --expires-in-days 30 `
   --out ./data/infra-attestations.json
 ```
+
+The admin private key is read from `ADMIN_KEY_FILE` (path to a hex-key file) or
+`ADMIN_KEY` (raw hex). The legacy `--admin-privkey` CLI argument still works but
+is deprecated (exposed via `ps`/shell history) and prints a warning.
 
 The command writes/updates an `InfraAttestationV1` array and upserts by
 `(ws, clearlistId, infraId)` to avoid duplicates.

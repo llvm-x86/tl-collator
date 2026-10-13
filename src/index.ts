@@ -1,13 +1,16 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import wrtc from 'wrtc';
 
 import { loadConfig } from './config.js';
 import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg, WireMsg } from './types.js';
 import { verifyTraderSig, ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
+import { computeOrderId } from './canonical.js';
 import { TapeStore } from './tape.js';
 import { PeerSession } from './peerSession.js';
 import { isWireMsg } from './validate.js';
@@ -52,6 +55,9 @@ function normalizeRpcMethod(method: unknown): string {
   return String(method || '').trim().toLowerCase();
 }
 
+// Minimum interval between full TAPE_SUB tape re-reads per session (H3).
+const TAPE_SUB_MIN_INTERVAL_MS = 1000;
+
 function isPublicRpcMethod(method: unknown): boolean {
   return PUBLIC_RPC_METHODS.has(normalizeRpcMethod(method));
 }
@@ -68,7 +74,7 @@ function configuredCorsOrigins(): string[] {
 }
 
 function randId(): string {
-  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+  return crypto.randomBytes(8).toString('hex');
 }
 
 function safeJsonParse(s: string): any | null {
@@ -185,6 +191,15 @@ async function main() {
   const corsOrigins = configuredCorsOrigins();
   const isProduction = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
   const legacyTlProxyEnabled = !isProduction && String(process.env.TL_COLLATOR_ENABLE_LEGACY_TL_PROXY || '').trim() === '1';
+  // Master switch for all legacy relayer proxy routes (H2). Disabled by default:
+  // these paths bypass the public RPC allowlist and some can move funds.
+  const legacyProxyEnabled = String(process.env.LEGACY_PROXY_ENABLED || '').trim() === '1';
+  // Faucet proxying additionally requires an explicit opt-in (H2).
+  const legacyProxyFaucetEnabled = String(process.env.LEGACY_PROXY_FAUCET || '').trim() === '1';
+  // Only trust client-supplied proxy IP headers behind an operator-configured proxy (H1).
+  const trustProxy = String(process.env.TRUST_PROXY || '').trim() === '1';
+  // Hard cap on concurrent in-flight routed RPC requests (C2d/H3).
+  const pendingRpcMax = Math.max(1, Number(process.env.PENDING_RPC_MAX || '') || 1000);
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
     process.env.TL_WALLET_LISTENER_URL ||
@@ -197,7 +212,8 @@ async function main() {
   else {
     privHex = ensurePrivKeyHex(null);
     fs.mkdirSync(path.dirname(cfg.collatorKeyPath), { recursive: true });
-    fs.writeFileSync(cfg.collatorKeyPath, privHex, 'utf8');
+    // L1: private key must not be world-readable.
+    fs.writeFileSync(cfg.collatorKeyPath, privHex, { encoding: 'utf8', mode: 0o600 });
   }
   const pubHex = pubKeyFromPrivKeyHex(privHex);
   const collatorId = sha256Hex(pubHex);
@@ -229,6 +245,7 @@ async function main() {
   const peers = new Set<PeerSession>();
   const rpcAdvertisements = new Map<PeerSession, { nodeId: string; services: RpcServiceAdvertisementV1[]; lastSeenTs: number }>();
   const pendingRpc = new Map<string, {
+    wireId: string;
     requester?: PeerSession;
     provider: PeerSession;
     providerNodeId: string;
@@ -236,6 +253,10 @@ async function main() {
     resolve?: (res: RpcResponseV1) => void;
     reject?: (err: Error) => void;
   }>();
+
+  // C2c: pending entries are namespaced by the assigned provider session, so a
+  // wire-supplied req.id can never overwrite another session's pending entry.
+  const pendingRpcKey = (providerSessionId: string, wireId: string): string => `${providerSessionId}:${wireId}`;
 
   const pruneRpcAdvertisements = (): void => {
     const now = Date.now();
@@ -313,6 +334,21 @@ async function main() {
     }
 
     const timeoutMs = Math.max(1000, Math.min(120000, Number(rpcReq.timeoutMs || 12000)));
+    // C2d/H3: bound the number of concurrent in-flight routed requests.
+    if (pendingRpc.size >= pendingRpcMax) {
+      const res = publicRpcError(rpcReq.id, 'RPC_OVERLOADED', 'too many pending routed RPC requests');
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    }
+    // C2c: refuse client-chosen ids that collide with an in-flight request on
+    // the same provider instead of overwriting (which would orphan the earlier
+    // caller's promise until timeout).
+    const pendingKey = pendingRpcKey(provider.session.id, rpcReq.id);
+    if (pendingRpc.has(pendingKey)) {
+      const res = publicRpcError(rpcReq.id, 'RPC_ID_COLLISION', 'request id already pending for this provider');
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    }
     logPortfolioHeartbeat('rpc', 'provider-selected', {
       service: rpcReq.service,
       method: rpcReq.method,
@@ -322,7 +358,7 @@ async function main() {
     });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        pendingRpc.delete(rpcReq.id);
+        pendingRpc.delete(pendingKey);
         const advert = rpcAdvertisements.get(provider.session);
         if (advert && advert.nodeId === provider.nodeId) {
           rpcAdvertisements.delete(provider.session);
@@ -348,9 +384,28 @@ async function main() {
         reject(new Error(res.error?.message || 'routed RPC timed out'));
       }, timeoutMs);
 
-      pendingRpc.set(rpcReq.id, { requester, provider: provider.session, providerNodeId: provider.nodeId, timer, resolve, reject });
+      pendingRpc.set(pendingKey, { wireId: rpcReq.id, requester, provider: provider.session, providerNodeId: provider.nodeId, timer, resolve, reject });
       provider.session.sendDc({ t: 'RPC_REQ', v: 1, req: rpcReq });
     });
+  };
+
+  // H2: the legacy relayer proxy is disabled unless LEGACY_PROXY_ENABLED=1.
+  // A 503 (>=500) makes every caller with a routed-RPC fallback fall through to
+  // the allowlisted path; proxy-only routes end in 404, as before.
+  const legacyProxyGate = (pathname: string): { statusCode: number; body: any } | null => {
+    if (!legacyProxyEnabled) {
+      return {
+        statusCode: 503,
+        body: { error: { code: 'LEGACY_PROXY_DISABLED', message: 'Legacy relayer proxy is disabled (set LEGACY_PROXY_ENABLED=1 to enable)' } },
+      };
+    }
+    if (pathname.startsWith('/address/faucet') && !legacyProxyFaucetEnabled) {
+      return {
+        statusCode: 503,
+        body: { error: { code: 'LEGACY_PROXY_FAUCET_DISABLED', message: 'Faucet proxying is disabled (requires LEGACY_PROXY_ENABLED=1 and LEGACY_PROXY_FAUCET=1)' } },
+      };
+    }
+    return null;
   };
 
   const proxyLegacyJson = async (
@@ -360,6 +415,8 @@ async function main() {
     query?: Record<string, string>,
     headers?: Record<string, string>,
   ): Promise<{ statusCode: number; body: any }> => {
+    const gated = legacyProxyGate(pathname);
+    if (gated) return gated;
     const url = new URL(`${legacyRelayerBaseUrl}${pathname}`);
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -375,13 +432,18 @@ async function main() {
   };
 
   const getRequestIp = (req: http.IncomingMessage): string => {
-    const cf = req.headers['cf-connecting-ip'];
-    if (typeof cf === 'string' && cf.trim()) return cf.trim();
-    const xreal = req.headers['x-real-ip'];
-    if (typeof xreal === 'string' && xreal.trim()) return xreal.trim();
-    const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
-    return String((req as any)?.socket?.remoteAddress || '127.0.0.1');
+    // H1: client-supplied proxy headers are only trustworthy when the operator
+    // explicitly deployed this collator behind a trusted proxy (TRUST_PROXY=1);
+    // otherwise any client could spoof its IP to bypass IP-intel gating.
+    if (trustProxy) {
+      const cf = req.headers['cf-connecting-ip'];
+      if (typeof cf === 'string' && cf.trim()) return cf.trim();
+      const xreal = req.headers['x-real-ip'];
+      if (typeof xreal === 'string' && xreal.trim()) return xreal.trim();
+      const xff = req.headers['x-forwarded-for'];
+      if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
+    }
+    return String((req as any)?.socket?.remoteAddress || '');
   };
 
   const routeCompatRpcRequest = async (method: string, params: unknown[], replyPath: string): Promise<{ statusCode: number; body: any }> => {
@@ -425,11 +487,14 @@ async function main() {
     };
   };
 
-  const settleRpcResponse = (res: RpcResponseV1): void => {
-    const pending = pendingRpc.get(res.id);
+  const settleRpcResponse = (res: RpcResponseV1, sender: PeerSession): void => {
+    // C2a: only accept RPC_RES from the session the request was routed to.
+    const pendingKey = pendingRpcKey(sender.id, res.id);
+    const pending = pendingRpc.get(pendingKey);
     if (!pending) return;
+    if (pending.provider !== sender) return;
     clearTimeout(pending.timer);
-    pendingRpc.delete(res.id);
+    pendingRpc.delete(pendingKey);
     const routed = pending.providerNodeId ? { ...res, providerNodeId: pending.providerNodeId } : res;
     logPortfolioHeartbeat('rpc', 'response', {
       id: res.id,
@@ -483,11 +548,21 @@ async function main() {
       }
 
       if (u.pathname === '/attestation/ip') {
+        // H1: determine the client IP first and validate it before any use.
+        const ip = getRequestIp(req);
+        if (!ip || net.isIP(ip) === 0) {
+          writeJson(res, 400, { success: false, error: 'Unable to determine client IP' });
+          return;
+        }
         try {
+          // Only forward proxy headers when TRUST_PROXY=1; otherwise they are
+          // client-controlled and would let callers spoof the attested IP.
           const proxyHeaders: Record<string, string> = {};
-          for (const name of ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto']) {
-            const value = req.headers[name];
-            if (typeof value === 'string' && value.trim()) proxyHeaders[name] = value;
+          if (trustProxy) {
+            for (const name of ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto']) {
+              const value = req.headers[name];
+              if (typeof value === 'string' && value.trim()) proxyHeaders[name] = value;
+            }
           }
           const proxied = await proxyLegacyJson(req.method || 'GET', '/attestation/ip', undefined, undefined, proxyHeaders);
           if (proxied.statusCode < 500) {
@@ -495,11 +570,6 @@ async function main() {
             return;
           }
         } catch {}
-        const ip = getRequestIp(req);
-        if (!ip) {
-          writeJson(res, 400, { success: false, error: 'Unable to determine client IP' });
-          return;
-        }
         try {
           const intel = ipIntel ? await ipIntel.lookup(ip) : null;
           const isVpn = !!intel?.vpn;
@@ -554,7 +624,7 @@ async function main() {
           return;
         }
 
-        if (!legacyTlProxyEnabled) {
+        if (!legacyTlProxyEnabled || !legacyProxyEnabled) {
           writeJson(res, 404, { error: { code: 'LEGACY_TL_PROXY_DISABLED', message: 'Legacy /tl_* proxy is disabled' } });
           return;
         }
@@ -924,6 +994,8 @@ async function main() {
     peers.add(sess);
 
     let pc: any = null;
+    // H3c: per-session rate limit for full tape re-reads.
+    let lastTapeSubTs = 0;
 
     const sendSignal = (m: SignalMsg) => {
       if (ws.readyState !== ws.OPEN) return;
@@ -942,12 +1014,12 @@ async function main() {
       sessions.delete(id);
       peers.delete(sess);
       rpcAdvertisements.delete(sess);
-      for (const [reqId, pending] of Array.from(pendingRpc.entries())) {
+      for (const [pendingKey, pending] of Array.from(pendingRpc.entries())) {
         if (pending.requester !== sess && pending.provider !== sess) continue;
         clearTimeout(pending.timer);
-        pendingRpc.delete(reqId);
+        pendingRpc.delete(pendingKey);
         const res: RpcResponseV1 = {
-          id: reqId,
+          id: pending.wireId,
           ok: false,
           error: { code: 'RPC_PEER_CLOSED', message: 'routed RPC peer disconnected before response' },
         };
@@ -975,6 +1047,18 @@ async function main() {
 
         if (msg.t === 'SIGNAL_OFFER') {
           // Collator is the answerer.
+          // H3a: close/replace any previous peer connection for this session;
+          // otherwise a client looping offers leaks native WebRTC/ICE resources.
+          if (pc || sess.dc) {
+            try {
+              sess.dc?.close();
+            } catch {}
+            sess.dc = null;
+            try {
+              pc?.close?.();
+            } catch {}
+            pc = null;
+          }
           pc = new (wrtc as any).RTCPeerConnection({ iceServers: cfg.iceServers });
 
           pc.onicecandidate = (ev: any) => {
@@ -1088,11 +1172,18 @@ async function main() {
               }
 
               if (wm.t === 'RPC_RES') {
-                settleRpcResponse(wm.res);
+                settleRpcResponse(wm.res, sess);
                 return;
               }
 
               if (wm.t === 'TAPE_SUB') {
+                // H3c: rate-limit full tape re-reads per session.
+                const nowTs = Date.now();
+                if (nowTs - lastTapeSubTs < TAPE_SUB_MIN_INTERVAL_MS) {
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent' });
+                  return;
+                }
+                lastTapeSubTs = nowTs;
                 sess.wantsTape = true;
                 const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
                 const lastSeq = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
@@ -1117,6 +1208,20 @@ async function main() {
                 }
                 if (!verifyTraderSig(order.orderId, order.sigTrader, order.traderPubKey)) {
                   sess.sendDc({ t: 'ERR', v: 1, code: 'bad_sig', msg: 'sigTrader verify failed' });
+                  return;
+                }
+                // C1: bind sigTrader to the order content. orderId must be the
+                // canonical derivation over body/traderPubKey/clientNonce
+                // (TL-Canon v1); otherwise a harvested (orderId, sigTrader,
+                // traderPubKey) triple could be replayed with an arbitrary body.
+                const expectedOrderId = computeOrderId(order.body, order.traderPubKey, order.clientNonce);
+                if (order.orderId !== expectedOrderId) {
+                  sess.sendDc({
+                    t: 'ERR',
+                    v: 1,
+                    code: 'bad_order_id',
+                    msg: 'orderId must equal sha256(stableStringify(body) + traderPubKey + clientNonce), lowercase hex',
+                  });
                   return;
                 }
 
