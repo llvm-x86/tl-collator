@@ -14,6 +14,7 @@ export class TapeStore {
   private idxPath: string;
   private idxStride: number;
   private replayBatch: number;
+  private maxReplayEntries: number;
 
   private lastSeq: number = 0;
   private lastHash: string = '';
@@ -25,12 +26,16 @@ export class TapeStore {
   private collatorPrivKeyHex: string;
 
   private idx: TapeIndex | null = null;
+  // Byte length of the tape file, tracked across appends so the index can be
+  // extended in place instead of being rebuilt (a full re-scan) after each one.
+  private tapeBytes: number = 0;
 
   constructor(opts: {
     tapePath: string;
     idxPath: string;
     idxStride: number;
     replayBatch: number;
+    maxReplayEntries: number;
     collatorId: string;
     collatorPrivKeyHex: string;
   }) {
@@ -38,10 +43,14 @@ export class TapeStore {
     this.idxPath = opts.idxPath;
     this.idxStride = Math.max(1, opts.idxStride);
     this.replayBatch = Math.max(1, opts.replayBatch);
+    // A non-finite bound would make the resync clamp vacuous; refuse it loudly.
+    if (!Number.isFinite(opts.maxReplayEntries)) throw new Error('TapeStore: maxReplayEntries must be a finite number');
+    this.maxReplayEntries = Math.max(1, Math.floor(opts.maxReplayEntries));
     this.collatorId = opts.collatorId;
     this.collatorPrivKeyHex = opts.collatorPrivKeyHex;
     fs.mkdirSync(path.dirname(this.tapePath), { recursive: true });
     this.loadFromDisk();
+    this.tapeBytes = fs.existsSync(this.tapePath) ? fs.statSync(this.tapePath).size : 0;
     this.loadOrBuildIndex();
   }
 
@@ -94,6 +103,13 @@ export class TapeStore {
     return this.traderByOrderId.get(orderId) || null;
   }
 
+  // Covers every entry on disk (loaded at startup) and every append since, so
+  // an orderId can never be recorded twice — including after a restart, when
+  // a harvested SUBMIT would otherwise be re-accepted.
+  hasOrder(orderId: string): boolean {
+    return this.traderByOrderId.has(orderId);
+  }
+
   computeEntryHash(base: Omit<TapeEntryV1, 'entryHash' | 'sigCollator'>): string {
     // Must match wallet TapeVerifier.computeEntryHash material shape.
     const material = stableStringify({
@@ -107,7 +123,11 @@ export class TapeStore {
     return sha256Hex(material);
   }
 
-  append(order: OrderEnvelopeV1): TapeEntryV1 {
+  // Atomic check-and-append: nothing is awaited between the duplicate check and
+  // the write, so two identical SUBMITs cannot both land. Returns null (and
+  // writes nothing) when the orderId is already on the tape.
+  append(order: OrderEnvelopeV1): TapeEntryV1 | null {
+    if (this.traderByOrderId.has(order.orderId)) return null;
     const seq = this.lastSeq + 1;
     const prevHash = this.lastHash;
     const receivedTs = Date.now();
@@ -126,20 +146,33 @@ export class TapeStore {
     const sigCollator = signWithPrivKeyHex(sigMsg, this.collatorPrivKeyHex);
 
     const entry: TapeEntryV1 = { ...base, entryHash, sigCollator };
-    fs.appendFileSync(this.tapePath, JSON.stringify(entry) + '\n', 'utf8');
+    const line = JSON.stringify(entry) + '\n';
+    const lineOffset = this.tapeBytes;
+    fs.appendFileSync(this.tapePath, line, 'utf8');
+    this.tapeBytes += Buffer.byteLength(line, 'utf8');
 
     this.lastSeq = seq;
     this.lastHash = entryHash;
     this.traderByOrderId.set(order.orderId, order.traderPubKey);
 
-    // Index is based on file size; easiest is to mark stale and rebuild lazily.
-    this.idx = null;
+    // Keep the seek index current: offsets[i] is the line for seq i*stride+1.
+    if (this.idx) {
+      if ((seq - 1) % this.idx.stride === 0) this.idx.offsets.push(lineOffset);
+      this.idx.tapeSize = this.tapeBytes;
+    }
     return entry;
   }
 
-  // Stream replay for backpressure. Calls onEntry for each entry.
-  async replayFromSeq(fromSeq: number, onEntry: (e: TapeEntryV1) => void): Promise<number> {
-    if (!fs.existsSync(this.tapePath)) return this.lastSeq;
+  // Stream replay for backpressure. Calls onEntry for each entry. A resync is
+  // bounded to the newest `maxReplayEntries` entries so one TAPE_SUB cannot
+  // force a full-file read; the returned `fromSeq` is the first seq actually
+  // replayed, which callers must report so a clamped resync is visible.
+  async replayFromSeq(
+    requestedFromSeq: number,
+    onEntry: (e: TapeEntryV1) => void,
+  ): Promise<{ fromSeq: number; lastSeq: number }> {
+    const fromSeq = Math.max(requestedFromSeq, this.lastSeq - this.maxReplayEntries + 1, 1);
+    if (!fs.existsSync(this.tapePath)) return { fromSeq, lastSeq: this.lastSeq };
     const idx = this.idx || (this.loadOrBuildIndex(), this.idx);
     const startOffset = idx ? findStartOffset(idx, fromSeq) : 0;
 
@@ -180,7 +213,7 @@ export class TapeStore {
         }
       }
 
-      return Math.max(lastSentSeq, this.lastSeq);
+      return { fromSeq, lastSeq: Math.max(lastSentSeq, this.lastSeq) };
     } finally {
       try {
         fs.closeSync(fd);

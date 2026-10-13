@@ -14,7 +14,9 @@ import { computeEnvelopeHash } from './canonical.js';
 import { TapeStore } from './tape.js';
 import { PeerSession } from './peerSession.js';
 import { isWireMsg } from './validate.js';
-import { LruSet } from './lru.js';
+import { LruMap } from './lru.js';
+import { ConcurrencyCounter, TokenBucket } from './ratelimit.js';
+import { createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
 import { buildManifest } from './manifest.js';
@@ -204,13 +206,15 @@ async function main() {
   const legacyProxyEnabled = String(process.env.LEGACY_PROXY_ENABLED || '').trim() === '1';
   // Faucet proxying additionally requires an explicit opt-in (H2).
   const legacyProxyFaucetEnabled = String(process.env.LEGACY_PROXY_FAUCET || '').trim() === '1';
-  // Only trust client-supplied proxy IP headers behind an operator-configured proxy (H1).
-  const trustProxy = String(process.env.TRUST_PROXY || '').trim() === '1';
+  // The only place client IPs are derived. Headers are believed solely from
+  // TRUST_PROXY_CIDRS hops (validated at startup in config.ts).
+  const clientIpResolver = createClientIpResolver(cfg.trustedProxy);
   // Hard cap on concurrent in-flight routed RPC requests (C2d/H3).
   const pendingRpcMax = Math.max(1, Number(process.env.PENDING_RPC_MAX || '') || 1000);
-  // Per-session admission cap on outstanding routed RPC requests: stops two
-  // colluding sessions from filling the global pendingRpc pool (and pinning a
-  // silent provider) to trigger RPC_OVERLOADED for everyone else.
+  // Per-client admission cap on outstanding routed RPC requests: stops two
+  // colluding sessions (or one HTTP client IP) from filling the global
+  // pendingRpc pool and pinning a silent provider to trigger RPC_OVERLOADED for
+  // everyone else.
   const pendingRpcMaxPerSession = Math.max(0, Number(process.env.PENDING_RPC_MAX_PER_SESSION || '') || 32);
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
@@ -237,10 +241,10 @@ async function main() {
     idxPath: cfg.idxPath,
     idxStride: cfg.idxStride,
     replayBatch: cfg.replayBatch,
+    maxReplayEntries: cfg.tapeResyncMaxEntries,
     collatorId,
     collatorPrivKeyHex: privHex,
   });
-  const seen = new LruSet(Number(process.env.SEEN_ORDERIDS_MAX || 100000));
   const clearlist = cfg.clearlistEnforce && cfg.clearlistUrl ? new ClearlistClient({ baseUrl: cfg.clearlistUrl }) : null;
   const ipIntel = cfg.ipIntelUrl ? new IpIntelClient({ url: cfg.ipIntelUrl, ttlSec: cfg.ipIntelTtlSec, max: 5000 }) : null;
   const audit = new AuditLog(cfg.ipLogging === 'on' ? path.join(cfg.dataDir, 'audit.log') : null);
@@ -256,9 +260,21 @@ async function main() {
   const sessions = new Map<string, PeerSession>();
   const peers = new Set<PeerSession>();
   const rpcAdvertisements = new Map<PeerSession, { nodeId: string; services: RpcServiceAdvertisementV1[]; lastSeenTs: number }>();
+  // Admission identity for routed RPCs: `sess:<id>` for WebSocket requesters,
+  // `ip:<resolved client ip>` for HTTP callers (no session object exists there).
+  // One counter enforces PENDING_RPC_MAX_PER_SESSION for both, so an HTTP flood
+  // is bounded per client exactly like a WebSocket session.
+  const sessionClientKey = (sess: PeerSession): string => `sess:${sess.id}`;
+  const ipClientKey = (ip: string): string => `ip:${ip || 'unknown'}`;
+  const rpcAdmission = new ConcurrencyCounter();
+  // Per-client-IP token buckets for the unauthenticated HTTP RPC entry points
+  // (/rpc/route, /rpc/:method); see httpRpcAllowed.
+  const httpRpcBuckets = new LruMap<TokenBucket>(5000);
+
   const pendingRpc = new Map<string, {
     wireId: string;
     requester?: PeerSession;
+    clientKey: string;
     provider: PeerSession;
     providerNodeId: string;
     timer: NodeJS.Timeout;
@@ -271,13 +287,13 @@ async function main() {
   const pendingRpcKey = (providerSessionId: string, wireId: string): string => `${providerSessionId}:${wireId}`;
 
   // Single release path for pending entries: clears the timer, drops the entry
-  // and keeps the per-session outstanding counter (requester side) in sync.
+  // and keeps the client admission counter in sync.
   const releasePending = (pendingKey: string) => {
     const pending = pendingRpc.get(pendingKey);
     if (!pending) return null;
     clearTimeout(pending.timer);
     pendingRpc.delete(pendingKey);
-    if (pending.requester && pending.requester.pendingRpcCount > 0) pending.requester.pendingRpcCount -= 1;
+    rpcAdmission.release(pending.clientKey);
     return pending;
   };
 
@@ -318,7 +334,10 @@ async function main() {
     return null;
   };
 
-  const routeRpcRequest = (rpcReq: RpcRequestV1, requester?: PeerSession): Promise<RpcResponseV1> => {
+  // `clientKey` is the admission identity the request is charged to (see
+  // sessionClientKey / ipClientKey). `requester` is set only for WebSocket
+  // callers, who receive RPC_RES over their DataChannel.
+  const routeRpcRequest = (rpcReq: RpcRequestV1, clientKey: string, requester?: PeerSession): Promise<RpcResponseV1> => {
     logPortfolioHeartbeat('rpc', 'request', {
       service: rpcReq.service,
       method: rpcReq.method,
@@ -357,11 +376,14 @@ async function main() {
     }
 
     const timeoutMs = Math.max(1000, Math.min(120000, Number(rpcReq.timeoutMs || 12000)));
-    // Per-session admission cap: one requester (or a colluding pair) must not
-    // be able to fill the global pendingRpc pool and starve every other caller.
-    if (requester && pendingRpcMaxPerSession > 0 && requester.pendingRpcCount >= pendingRpcMaxPerSession) {
-      const res = publicRpcError(rpcReq.id, 'RPC_SESSION_OVERLOADED', 'too many outstanding routed RPC requests for this session');
-      requester.sendDc({ t: 'RPC_RES', v: 1, res });
+    // Per-client admission cap: one requester (or a colluding pair, or one HTTP
+    // client IP) must not be able to fill the global pendingRpc pool and starve
+    // every other caller.
+    if (pendingRpcMaxPerSession > 0 && rpcAdmission.get(clientKey) >= pendingRpcMaxPerSession) {
+      const res = requester
+        ? publicRpcError(rpcReq.id, 'RPC_SESSION_OVERLOADED', 'too many outstanding routed RPC requests for this session')
+        : publicRpcError(rpcReq.id, 'RPC_IP_OVERLOADED', 'too many outstanding routed RPC requests for this client');
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
       return Promise.resolve(res);
     }
     // C2d/H3: bound the number of concurrent in-flight routed requests.
@@ -414,8 +436,17 @@ async function main() {
         reject(new Error(res.error?.message || 'routed RPC timed out'));
       }, timeoutMs);
 
-      pendingRpc.set(pendingKey, { wireId: rpcReq.id, requester, provider: provider.session, providerNodeId: provider.nodeId, timer, resolve, reject });
-      if (requester) requester.pendingRpcCount += 1;
+      pendingRpc.set(pendingKey, {
+        wireId: rpcReq.id,
+        requester,
+        clientKey,
+        provider: provider.session,
+        providerNodeId: provider.nodeId,
+        timer,
+        resolve,
+        reject,
+      });
+      rpcAdmission.acquire(clientKey);
       provider.session.sendDc({ t: 'RPC_REQ', v: 1, req: rpcReq });
     });
   };
@@ -462,30 +493,25 @@ async function main() {
     return { statusCode: res.status, body: await readResponseBody(res) };
   };
 
-  const getRequestIp = (req: http.IncomingMessage): string => {
-    // H1: client-supplied proxy headers are only trustworthy when the operator
-    // explicitly deployed this collator behind a trusted reverse proxy
-    // (TRUST_PROXY=1); otherwise any client could spoof its IP to bypass
-    // IP-intel gating and we use the socket peer address instead.
-    if (trustProxy) {
-      // Single-value headers set by the immediate trusted proxy/CDN first.
-      const cf = req.headers['cf-connecting-ip'];
-      if (typeof cf === 'string' && cf.trim()) return cf.trim();
-      const xreal = req.headers['x-real-ip'];
-      if (typeof xreal === 'string' && xreal.trim()) return xreal.trim();
-      const xff = req.headers['x-forwarded-for'];
-      if (typeof xff === 'string' && xff.trim()) {
-        // XFF is client-controlled on the left (any appending hop can spoof it).
-        // The rightmost entry is the one appended by the nearest trusted proxy
-        // and is the only hop we can vouch for; leftmost would be spoofable.
-        const hops = xff.split(',').map((s) => s.trim()).filter(Boolean);
-        if (hops.length > 0) return hops[hops.length - 1];
-      }
+  // Per-client-IP rate limit for the unauthenticated HTTP RPC entry points.
+  // Returns false once the caller's bucket (HTTP_RPC_PER_IP_BURST, refilled at
+  // HTTP_RPC_PER_IP_RPS) is empty.
+  const httpRpcAllowed = (ip: string): boolean => {
+    const key = ipClientKey(ip);
+    let bucket = httpRpcBuckets.get(key);
+    if (!bucket) {
+      bucket = new TokenBucket({ capacity: cfg.httpRpcPerIpBurst, refillPerSec: cfg.httpRpcPerIpRps });
+      httpRpcBuckets.set(key, bucket);
     }
-    return String((req as any)?.socket?.remoteAddress || '');
+    return bucket.allow(1);
   };
 
-  const routeCompatRpcRequest = async (method: string, params: unknown[], replyPath: string): Promise<{ statusCode: number; body: any }> => {
+  const routeCompatRpcRequest = async (
+    method: string,
+    params: unknown[],
+    replyPath: string,
+    clientKey: string,
+  ): Promise<{ statusCode: number; body: any }> => {
     if (!isPublicRpcMethod(method)) {
       return {
         statusCode: 403,
@@ -499,7 +525,7 @@ async function main() {
       params,
       ...(compatRpcNetwork ? { network: compatRpcNetwork } : {}),
     };
-    const routed = await routeRpcRequest(rpcReq);
+    const routed = await routeRpcRequest(rpcReq, clientKey);
     if (routed.ok) {
       return { statusCode: 200, body: { data: routed.result } };
     }
@@ -518,7 +544,7 @@ async function main() {
       }
     }
     return {
-      statusCode: routed.error?.code === 'NO_RPC_PROVIDER' ? 503 : 502,
+      statusCode: routed.error?.code === 'NO_RPC_PROVIDER' ? 503 : routed.error?.code === 'RPC_IP_OVERLOADED' ? 429 : 502,
       body: {
         error: routed.error?.message || `compat RPC failed on ${replyPath}`,
         code: routed.error?.code || 'RPC_ERROR',
@@ -548,6 +574,11 @@ async function main() {
   server.on('request', (req, res) => {
     void (async () => {
       const u = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+
+      // Resolve the client IP once through the trust-gated resolver; per-IP
+      // rate limits and routed-RPC admission below are keyed on it.
+      const clientIp = clientIpResolver.resolve(req);
+      const clientKey = ipClientKey(clientIp);
 
       const requestOrigin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
       const originAllowed = !!requestOrigin && corsOrigins.includes(requestOrigin);
@@ -588,16 +619,16 @@ async function main() {
 
       if (u.pathname === '/attestation/ip') {
         // H1: determine the client IP first and validate it before any use.
-        const ip = getRequestIp(req);
+        const ip = clientIp;
         if (!ip || net.isIP(ip) === 0) {
           writeJson(res, 400, { success: false, error: 'Unable to determine client IP' });
           return;
         }
         try {
-          // Only forward proxy headers when TRUST_PROXY=1; otherwise they are
+          // Only forward proxy headers from a trusted hop; otherwise they are
           // client-controlled and would let callers spoof the attested IP.
           const proxyHeaders: Record<string, string> = {};
-          if (trustProxy) {
+          if (clientIpResolver.headersTrusted(req)) {
             for (const name of ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto']) {
               const value = req.headers[name];
               if (typeof value === 'string' && value.trim()) proxyHeaders[name] = value;
@@ -688,6 +719,11 @@ async function main() {
           writeJson(res, 403, { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
           return;
         }
+        // Per-IP rate limit on the unauthenticated /rpc/:method entry point.
+        if (!httpRpcAllowed(clientIp)) {
+          writeJson(res, 429, { error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
+          return;
+        }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
         if (method.toLowerCase() === 'tl_bitvmstatus') {
           writeJson(res, 200, buildBitvmStatusFromArtifacts(raw || {}));
@@ -699,7 +735,7 @@ async function main() {
           pathname: u.pathname,
           paramsCount: params.length,
         });
-        const compat = await routeCompatRpcRequest(method, params, u.pathname);
+        const compat = await routeCompatRpcRequest(method, params, u.pathname, clientKey);
         logPortfolioHeartbeat('http', '/rpc compat response', {
           method,
           pathname: u.pathname,
@@ -711,6 +747,11 @@ async function main() {
       }
 
       if (req.method === 'POST' && u.pathname === '/rpc/route') {
+        // Per-IP rate limit on /rpc/route (same bucket as /rpc/:method).
+        if (!httpRpcAllowed(clientIp)) {
+          writeJson(res, 429, { ok: false, error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
+          return;
+        }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
         const rpcReq = normalizeRpcRequest(raw);
         if (!rpcReq) {
@@ -732,7 +773,7 @@ async function main() {
           sourceEndpoint: rpcReq.sourceEndpoint || null,
           ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
         });
-        const routed = await routeRpcRequest(rpcReq);
+        const routed = await routeRpcRequest(rpcReq, clientKey);
         logPortfolioHeartbeat('http', '/rpc/route response', {
           service: rpcReq.service,
           method: rpcReq.method,
@@ -754,7 +795,7 @@ async function main() {
           }
         } catch {}
         logPortfolioHeartbeat('http', '/chain/info fallback', {});
-        const compat = await routeCompatRpcRequest('getblockchaininfo', [], u.pathname);
+        const compat = await routeCompatRpcRequest('getblockchaininfo', [], u.pathname, clientKey);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -772,7 +813,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('validateaddress', [address], u.pathname);
+        const compat = await routeCompatRpcRequest('validateaddress', [address], u.pathname, clientKey);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -799,7 +840,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_getallbalancesforaddress', [address], u.pathname);
+        const compat = await routeCompatRpcRequest('tl_getallbalancesforaddress', [address], u.pathname, clientKey);
         logPortfolioHeartbeat('http', '/address/balance routed', {
           address,
           statusCode: compat.statusCode,
@@ -822,7 +863,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('sendtoaddress', [address, 1], u.pathname);
+        const compat = await routeCompatRpcRequest('sendtoaddress', [address, 1], u.pathname, clientKey);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -852,7 +893,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('listunspent', [0, 99999999, { address, ...(pubkey ? { pubkey } : {}) }], u.pathname);
+        const compat = await routeCompatRpcRequest('listunspent', [0, 99999999, { address, ...(pubkey ? { pubkey } : {}) }], u.pathname, clientKey);
         logPortfolioHeartbeat('http', '/address/utxo routed', {
           address,
           statusCode: compat.statusCode,
@@ -875,7 +916,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_gettransaction', [txid], u.pathname);
+        const compat = await routeCompatRpcRequest('tl_gettransaction', [txid], u.pathname, clientKey);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -888,7 +929,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_listproperties', [], u.pathname);
+        const compat = await routeCompatRpcRequest('tl_listproperties', [], u.pathname, clientKey);
         logPortfolioHeartbeat('http', '/token/list routed', {
           statusCode: compat.statusCode,
           mappedRpc: 'tl_listproperties',
@@ -908,7 +949,7 @@ async function main() {
           }
         } catch {}
         const rawtx = typeof raw?.rawtx === 'string' ? raw.rawtx : '';
-        const compat = await routeCompatRpcRequest('decoderawtransaction', [rawtx], u.pathname);
+        const compat = await routeCompatRpcRequest('decoderawtransaction', [rawtx], u.pathname, clientKey);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -923,7 +964,7 @@ async function main() {
           }
         } catch {}
         const rawTx = typeof raw?.rawTx === 'string' ? raw.rawTx : '';
-        const compat = await routeCompatRpcRequest('sendrawtransaction', [rawTx], u.pathname);
+        const compat = await routeCompatRpcRequest('sendrawtransaction', [rawTx], u.pathname, clientKey);
         writeJson(res, compat.statusCode, { txid: compat.body?.data ?? compat.body?.result ?? compat.body });
         return;
       }
@@ -999,7 +1040,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_getproperty', [Number(propId)], u.pathname);
+        const compat = await routeCompatRpcRequest('tl_getproperty', [Number(propId)], u.pathname, clientKey);
         logPortfolioHeartbeat('http', '/token/:propid routed', {
           propId: Number(propId),
           statusCode: compat.statusCode,
@@ -1065,7 +1106,9 @@ async function main() {
   if (typeof (sweepTimer as any)?.unref === 'function') (sweepTimer as any).unref();
 
   wss.on('connection', (ws, req) => {
-    const remoteIp = (req as any)?.socket?.remoteAddress ? String((req as any).socket.remoteAddress) : '';
+    // Cap by the resolved client IP, not the raw socket peer: behind a proxy the
+    // socket address is the proxy's and would give every client one shared budget.
+    const remoteIp = clientIpResolver.resolve(req);
     const ipKey = remoteIp || 'unknown';
 
     // Per-IP sub-cap first: a single source must not be able to hold a large
@@ -1275,7 +1318,7 @@ async function main() {
                   sourceEndpoint: rpcReq.sourceEndpoint || null,
                   ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
                 });
-                void routeRpcRequest(rpcReq, sess).catch((e: any) => {
+                void routeRpcRequest(rpcReq, sessionClientKey(sess), sess).catch((e: any) => {
                   sess.sendDc({
                     t: 'RPC_RES',
                     v: 1,
@@ -1307,9 +1350,11 @@ async function main() {
                 }
                 lastTapeSubTs = nowTs;
                 const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
-                const lastSeq = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
+                const replay = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
                 // Optional end marker; wallets that don't understand it should ignore.
-                sess.sendDc({ t: 'TAPE_END', v: 1, lastSeq });
+                // `fromSeq` is the first seq actually replayed: it is greater than the
+                // requested one when the resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
+                sess.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
                 return;
               }
 
@@ -1323,7 +1368,8 @@ async function main() {
                   sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid OrderEnvelopeV1 schema' });
                   return;
                 }
-                if (seen.has(order.orderId)) {
+                // Fast path only; the authoritative check is the atomic one in tape.append.
+                if (tape.hasOrder(order.orderId)) {
                   sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
                   return;
                 }
@@ -1434,8 +1480,13 @@ async function main() {
                   }
                 }
 
+                // Atomic duplicate check: the awaits above (IP intel, clearlist) mean
+                // an identical SUBMIT may have landed since the fast-path check.
                 const entry = tape.append(order);
-                seen.add(order.orderId);
+                if (!entry) {
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
+                  return;
+                }
                 audit.write({
                   ts: Date.now(),
                   collatorId,

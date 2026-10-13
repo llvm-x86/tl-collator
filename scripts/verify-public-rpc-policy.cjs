@@ -5,13 +5,21 @@ const path = require('node:path');
 
 const collatorPath = path.resolve(__dirname, '..', 'src', 'index.ts');
 const canonicalPath = path.resolve(__dirname, '..', 'src', 'canonical.ts');
+const clientIpPath = path.resolve(__dirname, '..', 'src', 'clientIp.ts');
 const schemaPath = path.resolve(__dirname, '..', 'src', 'schema.ts');
 const orderSchemaPath = path.resolve(__dirname, '..', 'spec', 'schemas', 'order-envelope.v1.schema.json');
-const relayerPath = process.env.TL_RELAYER_RPC_ROUTE_SOURCE || 'C:\\projects\\tl-relayer\\src\\routes\\rpc.route.ts';
+// The relayer checkout is a sibling of this repo (contrib/tl-relayer when both
+// are cloned side by side); TL_RELAYER_RPC_ROUTE_SOURCE overrides the location.
+const relayerPath = process.env.TL_RELAYER_RPC_ROUTE_SOURCE
+  || path.resolve(__dirname, '..', '..', 'tl-relayer', 'src', 'routes', 'rpc.route.ts');
 const collator = fs.readFileSync(collatorPath, 'utf8');
 const canonical = fs.readFileSync(canonicalPath, 'utf8');
+const clientIpSrc = fs.readFileSync(clientIpPath, 'utf8');
 const schemaSrc = fs.readFileSync(schemaPath, 'utf8');
 const orderSchema = fs.readFileSync(orderSchemaPath, 'utf8');
+if (!fs.existsSync(relayerPath)) {
+  throw new Error(`relayer RPC route source not found: ${relayerPath} (set TL_RELAYER_RPC_ROUTE_SOURCE)`);
+}
 const relayer = fs.readFileSync(relayerPath, 'utf8');
 
 function methodsFrom(source, name) {
@@ -75,8 +83,9 @@ for (const needle of [
   "code: 'LEGACY_PROXY_DISABLED'",
   'LEGACY_PROXY_FAUCET',
   "code: 'LEGACY_PROXY_FAUCET_DISABLED'",
-  'TRUST_PROXY',
-  'net.isIP(ip)',
+  'clientIpResolver.resolve(req)',
+  'clientIpResolver.headersTrusted(req)',
+  'net.isIP(ip) === 0',
   // Adversarial review fixes (batch 2): envelope-bound orderId (C1 complete),
   // endpoint allowlist regression (H2), connection fairness (H3b), TAPE_SUB
   // subscription survival, XFF rightmost hop, per-session pending RPC cap.
@@ -88,8 +97,11 @@ for (const needle of [
   "'decoderawtransaction'",
   'sess.wantsTape = true;',
   "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed'",
-  'hops[hops.length - 1]',
+  'rpcAdmission.acquire(clientKey)',
   'pendingRpcMaxPerSession',
+  "code: 'RPC_RATE_LIMITED'",
+  'tape.hasOrder(order.orderId)',
+  'if (!entry) {',
   "'RPC_SESSION_OVERLOADED'",
   'releasePending(pendingKey)',
   'CONN_IDLE_TIMEOUT_MS',
@@ -114,8 +126,18 @@ for (const needle of [
   if (!canonical.includes(needle)) throw new Error(`Canonical policy missing: ${needle}`);
 }
 
+// clientIp.ts: the single trusted-client-IP resolver; headers believed only from
+// configured proxy hops, and proxy configuration refused at startup when ambiguous.
+for (const needle of [
+  'TRUST_PROXY_CIDRS',
+  'TRUST_PROXY=1 requires TRUST_PROXY_CIDRS',
+  'if (!isTrustedHop(peer)) return peer;',
+]) {
+  if (!clientIpSrc.includes(needle)) throw new Error(`Client IP policy missing: ${needle}`);
+}
+
 // schema.ts: unsafe-key rejection before schema validation.
-for (const needle of ['findUnsafeKey', 'unsafe key not allowed']) {
+for (const needle of ['findCanonicalViolation', 'validateOrderEnvelope']) {
   if (!schemaSrc.includes(needle)) throw new Error(`Schema policy missing: ${needle}`);
 }
 

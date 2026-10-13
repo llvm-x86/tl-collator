@@ -109,7 +109,7 @@ Environment variables:
 - `COLLATOR_KEY_PATH` (default: `./data/collator.key`)
 - `MAX_MSG_BYTES` (default: `1048576`)
 - `SUBMIT_BURST` (default: `10`) and `SUBMIT_RPS` (default: `2`) (also accepts legacy `SUBMIT_RATE_PER_SEC`)
-- `SEEN_ORDERIDS_MAX` (default: `100000`)
+- `TAPE_RESYNC_MAX_ENTRIES` (default: `10000`): a `TAPE_SUB` resync replays at most this many of the newest tape entries. The `TAPE_END` reply carries `fromSeq`, the first seq actually replayed; when it is greater than the requested `fromSeq` the earlier history was not sent and must be fetched another way.
 - `NAME`, `OPERATOR`, `REGION` (optional manifest fields)
 - `CONN_MAX` (hard cap on concurrent WS connections, default `256`; set `0` to disable the cap)
 - `CONN_MAX_PER_IP` (default `16`; per-IP sub-cap on concurrent WS connections; `0` disables) — one source cannot hold a large share of the pool
@@ -130,18 +130,21 @@ Environment variables:
 - `TL_WALLET_LISTENER_URL` is also honored as the upstream fallback for legacy listener routes
 - `LEGACY_PROXY_ENABLED` (`0|1`, default `0`): master switch for all legacy relayer proxy routes (`/address/*`, `/tx/*`, `/token/*`, `/chain/info`, `/rpc/:method` fallback, `/attestation/ip` forwarding, `/tl_*`). Off by default because these paths bypass the public RPC allowlist. Enable only for a trusted local relayer.
 - `LEGACY_PROXY_FAUCET` (`0|1`, default `0`): additionally required to proxy `GET /address/faucet/:address`. This is a fund-moving endpoint — never enable it on an untrusted network.
-- `TRUST_PROXY` (`0|1`, default `0`): only trust client-IP headers when deployed behind a trusted reverse proxy. **Reverse-proxy deployments must set `TRUST_PROXY=1`** — otherwise the socket peer address (the proxy's) is used. With `TRUST_PROXY=1`, `cf-connecting-ip`/`x-real-ip` win over `x-forwarded-for`, and XFF is resolved to its **rightmost** hop (the entry appended by the nearest trusted proxy); the leftmost entries are client-controlled and are never trusted. Determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
+- `TRUST_PROXY` (`0|1`, default `0`): whether client-IP headers may be believed at all. Any other value aborts startup. **Behind a reverse proxy or CDN, set `TRUST_PROXY=1` together with `TRUST_PROXY_CIDRS`**; `TRUST_PROXY=1` without `TRUST_PROXY_CIDRS` aborts startup (before this change it was accepted and trusted any peer).
+- `TRUST_PROXY_CIDRS` (comma- or space-separated IPv4/IPv6 addresses or CIDRs, required with `TRUST_PROXY=1`, refused without it; IPv4-mapped IPv6 entries are refused, write IPv4 hops as IPv4): the proxy/CDN hop addresses. Headers are believed **only** when the TCP peer is inside this list. Then `cf-connecting-ip` and `x-real-ip` are used if present; otherwise `x-forwarded-for` is walked right to left past trusted hops and the first untrusted entry is the client. Malformed entries fail closed to the socket address. Client IPs are used for WS per-IP caps, HTTP rate limits, routed-RPC admission, IP intel and `/attestation/ip`.
 - `PENDING_RPC_MAX` (default `1000`): cap on concurrent in-flight routed RPC requests.
-- `PENDING_RPC_MAX_PER_SESSION` (default `32`, `0` disables): per-session cap on outstanding routed RPC requests, so one requester (or a colluding pair with a pinned provider) cannot fill the global pool and starve other callers.
+- `PENDING_RPC_MAX_PER_SESSION` (default `32`, `0` disables): cap on outstanding routed RPC requests per requester, so one requester (or a colluding pair with a pinned provider) cannot fill the global pool and starve other callers. A WebSocket requester is counted per session (`RPC_SESSION_OVERLOADED`); an HTTP caller is counted per resolved client IP (`RPC_IP_OVERLOADED`, HTTP 429).
+- `HTTP_RPC_PER_IP_RPS` (default `20`) and `HTTP_RPC_PER_IP_BURST` (default `40`): token bucket per resolved client IP for the unauthenticated HTTP RPC entry points `POST /rpc/route` and `POST /rpc/:method`. Exceeding it returns HTTP 429 `RPC_RATE_LIMITED`. Behind a proxy, set `TRUST_PROXY_CIDRS`, or every caller shares the proxy's bucket.
 - `TL_COLLATOR_RPC_SERVICE` / `TL_COLLATOR_RPC_NETWORK` tune routed RPC matching
 
 ### Security defaults
 
 - Legacy relayer proxy is **disabled** unless `LEGACY_PROXY_ENABLED=1`; the faucet path additionally requires `LEGACY_PROXY_FAUCET=1`.
-- Client IP is taken from the socket unless `TRUST_PROXY=1`; determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
+- Client IP is taken from the socket unless the peer is a configured `TRUST_PROXY_CIDRS` hop (see `TRUST_PROXY`); determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
 - Concurrent WS connections are capped by `CONN_MAX` (default `256`) and `CONN_MAX_PER_IP` (default `16`); silent (no-DataChannel) sessions idle for `CONN_IDLE_TIMEOUT_MS` (default 60 s) are reaped, and when the pool is full a fresh handshake displaces the oldest silent session (handshake reserve) instead of locking everyone out with `1013`.
 - Each `SIGNAL_OFFER` closes/replaces the session's previous `RTCPeerConnection`; `TAPE_SUB` full re-reads are rate-limited to one per second per session — a rate-limited `TAPE_SUB` keeps the live subscription active and only skips the replay.
-- `RPC_RES` is only accepted from the session the request was routed to; pending routed RPCs are namespaced per provider session, capped globally by `PENDING_RPC_MAX` and per requesting session by `PENDING_RPC_MAX_PER_SESSION`.
+- `RPC_RES` is only accepted from the session the request was routed to; pending routed RPCs are namespaced per provider session, capped globally by `PENDING_RPC_MAX` and per requester (session, or client IP for HTTP) by `PENDING_RPC_MAX_PER_SESSION`.
+- A `SUBMIT` whose `orderId` is already on the tape (including orders recorded before a restart) is refused with `DUPLICATE`; the check is made atomically at append time.
 - The generated collator key file is written with mode `0600`.
 
 Infra attestations (optional; used by wallets for curated-mode acceptability):

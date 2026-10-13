@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { parseTrustedProxyConfig, type TrustedProxyConfig } from './clientIp.js';
+
 export interface Config {
   port: number;
   wsPath: string;
@@ -28,6 +30,10 @@ export interface Config {
   ipIntelUrl: string | null;
   ipIntelTtlSec: number;
   connMax: number | null;
+  trustedProxy: TrustedProxyConfig;
+  tapeResyncMaxEntries: number;
+  httpRpcPerIpRps: number;
+  httpRpcPerIpBurst: number;
   tlsKeyPath: string | null;
   tlsCertPath: string | null;
   iceServers: RTCIceServer[];
@@ -97,6 +103,16 @@ export function loadConfig(): Config {
   // H3b: sane default connection cap; CONN_MAX=0 explicitly disables the cap.
   const connMaxConfigured = intEnv('CONN_MAX', 256);
 
+  // Startup-validated: a malformed or ambiguous proxy configuration aborts the
+  // process instead of silently trusting or ignoring client-IP headers.
+  const trustedProxy = parseTrustedProxyConfig(process.env);
+
+  // Upper bound on tape entries a single TAPE_SUB resync may replay.
+  const tapeResyncMaxEntries = Math.max(1, intEnv('TAPE_RESYNC_MAX_ENTRIES', 10000));
+  // Per-client-IP token bucket for the unauthenticated HTTP RPC entry points.
+  const httpRpcPerIpRps = Math.max(1, intEnv('HTTP_RPC_PER_IP_RPS', 20));
+  const httpRpcPerIpBurst = Math.max(1, intEnv('HTTP_RPC_PER_IP_BURST', 40));
+
   return {
     port: intEnv('PORT', intEnv('SERVER_PORT', 8787)),
     wsPath: process.env.WS_PATH || '/ws',
@@ -124,6 +140,10 @@ export function loadConfig(): Config {
     ipIntelUrl,
     ipIntelTtlSec,
     connMax: connMaxConfigured > 0 ? connMaxConfigured : null,
+    trustedProxy,
+    tapeResyncMaxEntries,
+    httpRpcPerIpRps,
+    httpRpcPerIpBurst,
     tlsKeyPath: process.env.TLS_KEY_PATH || null,
     tlsCertPath: process.env.TLS_CERT_PATH || null,
     iceServers,

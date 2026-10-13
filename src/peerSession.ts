@@ -19,11 +19,6 @@ export class PeerSession {
   // If true, peer has requested tape feed (or we treat all as subscribers).
   wantsTape: boolean = false;
 
-  // Outstanding routed RPC requests admitted for this session (requester side).
-  // Bounds one session (or a colluding pair) flooding the global pendingRpc
-  // pool and starving every other caller.
-  pendingRpcCount: number = 0;
-
   // SUBMIT rate limit (per-peer).
   submitBucket: TokenBucket;
 

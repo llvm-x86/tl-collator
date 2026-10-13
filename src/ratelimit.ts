@@ -27,3 +27,25 @@ export class TokenBucket {
   }
 }
 
+
+// Per-client count of outstanding (admitted, not yet released) operations.
+// Routed RPCs are keyed by requester identity — `sess:<id>` for WebSocket
+// sessions, `ip:<resolved client ip>` for HTTP callers — so every route shares
+// one admission mechanism. Keys with no outstanding work are dropped.
+export class ConcurrencyCounter {
+  private counts = new Map<string, number>();
+
+  get(key: string): number {
+    return this.counts.get(key) || 0;
+  }
+
+  acquire(key: string): void {
+    this.counts.set(key, this.get(key) + 1);
+  }
+
+  release(key: string): void {
+    const remaining = this.get(key) - 1;
+    if (remaining > 0) this.counts.set(key, remaining);
+    else this.counts.delete(key);
+  }
+}
