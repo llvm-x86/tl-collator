@@ -10,7 +10,7 @@ import wrtc from 'wrtc';
 import { loadConfig } from './config.js';
 import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg, WireMsg } from './types.js';
 import { verifyTraderSig, ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
-import { computeOrderId } from './canonical.js';
+import { computeEnvelopeHash } from './canonical.js';
 import { TapeStore } from './tape.js';
 import { PeerSession } from './peerSession.js';
 import { isWireMsg } from './validate.js';
@@ -49,6 +49,14 @@ const PUBLIC_RPC_METHODS = new Set([
   'tl_createpayload_attestation',
   'tl_createpayload_commit_tochannel',
   'tl_bitvmstatus',
+  // Read-only bitcoin-family RPCs backing the documented HTTP compat routes
+  // (/chain/info, /address/validate/*, /address/utxo/*, /tx/decode). These fall
+  // through to the WebRTC-routed path when the legacy proxy is disabled (H2),
+  // so they must stay on the allowlist (advertised providers may serve them).
+  'getblockchaininfo',
+  'validateaddress',
+  'listunspent',
+  'decoderawtransaction',
 ]);
 
 function normalizeRpcMethod(method: unknown): string {
@@ -200,6 +208,10 @@ async function main() {
   const trustProxy = String(process.env.TRUST_PROXY || '').trim() === '1';
   // Hard cap on concurrent in-flight routed RPC requests (C2d/H3).
   const pendingRpcMax = Math.max(1, Number(process.env.PENDING_RPC_MAX || '') || 1000);
+  // Per-session admission cap on outstanding routed RPC requests: stops two
+  // colluding sessions from filling the global pendingRpc pool (and pinning a
+  // silent provider) to trigger RPC_OVERLOADED for everyone else.
+  const pendingRpcMaxPerSession = Math.max(0, Number(process.env.PENDING_RPC_MAX_PER_SESSION || '') || 32);
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
     process.env.TL_WALLET_LISTENER_URL ||
@@ -257,6 +269,17 @@ async function main() {
   // C2c: pending entries are namespaced by the assigned provider session, so a
   // wire-supplied req.id can never overwrite another session's pending entry.
   const pendingRpcKey = (providerSessionId: string, wireId: string): string => `${providerSessionId}:${wireId}`;
+
+  // Single release path for pending entries: clears the timer, drops the entry
+  // and keeps the per-session outstanding counter (requester side) in sync.
+  const releasePending = (pendingKey: string) => {
+    const pending = pendingRpc.get(pendingKey);
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    pendingRpc.delete(pendingKey);
+    if (pending.requester && pending.requester.pendingRpcCount > 0) pending.requester.pendingRpcCount -= 1;
+    return pending;
+  };
 
   const pruneRpcAdvertisements = (): void => {
     const now = Date.now();
@@ -334,6 +357,13 @@ async function main() {
     }
 
     const timeoutMs = Math.max(1000, Math.min(120000, Number(rpcReq.timeoutMs || 12000)));
+    // Per-session admission cap: one requester (or a colluding pair) must not
+    // be able to fill the global pendingRpc pool and starve every other caller.
+    if (requester && pendingRpcMaxPerSession > 0 && requester.pendingRpcCount >= pendingRpcMaxPerSession) {
+      const res = publicRpcError(rpcReq.id, 'RPC_SESSION_OVERLOADED', 'too many outstanding routed RPC requests for this session');
+      requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    }
     // C2d/H3: bound the number of concurrent in-flight routed requests.
     if (pendingRpc.size >= pendingRpcMax) {
       const res = publicRpcError(rpcReq.id, 'RPC_OVERLOADED', 'too many pending routed RPC requests');
@@ -358,7 +388,7 @@ async function main() {
     });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        pendingRpc.delete(pendingKey);
+        releasePending(pendingKey);
         const advert = rpcAdvertisements.get(provider.session);
         if (advert && advert.nodeId === provider.nodeId) {
           rpcAdvertisements.delete(provider.session);
@@ -385,6 +415,7 @@ async function main() {
       }, timeoutMs);
 
       pendingRpc.set(pendingKey, { wireId: rpcReq.id, requester, provider: provider.session, providerNodeId: provider.nodeId, timer, resolve, reject });
+      if (requester) requester.pendingRpcCount += 1;
       provider.session.sendDc({ t: 'RPC_REQ', v: 1, req: rpcReq });
     });
   };
@@ -433,15 +464,23 @@ async function main() {
 
   const getRequestIp = (req: http.IncomingMessage): string => {
     // H1: client-supplied proxy headers are only trustworthy when the operator
-    // explicitly deployed this collator behind a trusted proxy (TRUST_PROXY=1);
-    // otherwise any client could spoof its IP to bypass IP-intel gating.
+    // explicitly deployed this collator behind a trusted reverse proxy
+    // (TRUST_PROXY=1); otherwise any client could spoof its IP to bypass
+    // IP-intel gating and we use the socket peer address instead.
     if (trustProxy) {
+      // Single-value headers set by the immediate trusted proxy/CDN first.
       const cf = req.headers['cf-connecting-ip'];
       if (typeof cf === 'string' && cf.trim()) return cf.trim();
       const xreal = req.headers['x-real-ip'];
       if (typeof xreal === 'string' && xreal.trim()) return xreal.trim();
       const xff = req.headers['x-forwarded-for'];
-      if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
+      if (typeof xff === 'string' && xff.trim()) {
+        // XFF is client-controlled on the left (any appending hop can spoof it).
+        // The rightmost entry is the one appended by the nearest trusted proxy
+        // and is the only hop we can vouch for; leftmost would be spoofable.
+        const hops = xff.split(',').map((s) => s.trim()).filter(Boolean);
+        if (hops.length > 0) return hops[hops.length - 1];
+      }
     }
     return String((req as any)?.socket?.remoteAddress || '');
   };
@@ -493,9 +532,9 @@ async function main() {
     const pending = pendingRpc.get(pendingKey);
     if (!pending) return;
     if (pending.provider !== sender) return;
-    clearTimeout(pending.timer);
-    pendingRpc.delete(pendingKey);
-    const routed = pending.providerNodeId ? { ...res, providerNodeId: pending.providerNodeId } : res;
+    const settled = releasePending(pendingKey);
+    if (!settled) return;
+    const routed = settled.providerNodeId ? { ...res, providerNodeId: settled.providerNodeId } : res;
     logPortfolioHeartbeat('rpc', 'response', {
       id: res.id,
       ok: !!res.ok,
@@ -978,20 +1017,94 @@ async function main() {
     });
   });
 
+  // ---- Connection fairness (adversarial review H3b follow-up) ------------
+  // CONN_MAX alone is trivially turned into a global lockout: 256 keep-alive
+  // sockets and every new client gets WS close 1013. Mitigations:
+  //  - idle reaper: sessions with no open DataChannel and no traffic for
+  //    CONN_IDLE_TIMEOUT_MS are swept every CONN_SWEEP_INTERVAL_MS.
+  //  - per-IP sub-cap: at most CONN_MAX_PER_IP concurrent WS connections per
+  //    remote IP (0 disables).
+  //  - handshake reserve: when the pool is full, a fresh handshake displaces
+  //    the oldest silent (unestablished) session; only a pool of fully
+  //    established DataChannel sessions refuses new connections with 1013.
+  const connIdleTimeoutMs = Math.max(1, Number(process.env.CONN_IDLE_TIMEOUT_MS || '') || 60000);
+  const connSweepIntervalMs = Math.max(1000, Number(process.env.CONN_SWEEP_INTERVAL_MS || '') || 15000);
+  const connMaxPerIp = Math.max(0, Number(process.env.CONN_MAX_PER_IP || '') || 16);
+  const connHandshakeGraceMs = Math.max(0, Number(process.env.CONN_HANDSHAKE_GRACE_MS || '') || 5000);
+  const perIpCounts = new Map<string, number>();
+
+  const isSilentPeer = (p: PeerSession): boolean => !p.dc || p.dc.readyState !== 'open';
+
+  const closePeer = (p: PeerSession, code: number, reason: string): void => {
+    try {
+      p.ws.close(code, reason);
+    } catch {}
+  };
+
+  const reapIdleSilentSessions = (nowTs: number = Date.now()): number => {
+    let reaped = 0;
+    for (const p of Array.from(peers)) {
+      if (!isSilentPeer(p)) continue;
+      if (nowTs - p.meta.lastSeenTs < connIdleTimeoutMs) continue;
+      logPortfolioHeartbeat('conn', 'idle-reaped', {
+        peerId: p.id,
+        ip: p.meta.remoteIp || null,
+        idleMs: nowTs - p.meta.lastSeenTs,
+      });
+      closePeer(p, 1013, 'idle connection reaped');
+      reaped++;
+    }
+    return reaped;
+  };
+
+  const sweepTimer = setInterval(() => {
+    try {
+      reapIdleSilentSessions();
+    } catch {}
+  }, connSweepIntervalMs);
+  if (typeof (sweepTimer as any)?.unref === 'function') (sweepTimer as any).unref();
+
   wss.on('connection', (ws, req) => {
-    if (typeof cfg.connMax === 'number' && cfg.connMax >= 0 && peers.size >= cfg.connMax) {
+    const remoteIp = (req as any)?.socket?.remoteAddress ? String((req as any).socket.remoteAddress) : '';
+    const ipKey = remoteIp || 'unknown';
+
+    // Per-IP sub-cap first: a single source must not be able to hold a large
+    // fraction of the pool (keep-alive socket floods).
+    if (connMaxPerIp > 0 && (perIpCounts.get(ipKey) || 0) >= connMaxPerIp) {
       try {
-        ws.close(1013, 'server busy');
+        ws.close(1013, 'too many connections from your ip');
       } catch {}
       return;
     }
 
+    if (typeof cfg.connMax === 'number' && cfg.connMax >= 0 && peers.size >= cfg.connMax) {
+      // Handshake reserve: reclaim room for this handshake before refusing.
+      reapIdleSilentSessions();
+      let victim: PeerSession | null = null;
+      for (const p of peers) {
+        if (!isSilentPeer(p)) continue;
+        if (Date.now() - p.meta.firstSeenTs < connHandshakeGraceMs) continue;
+        if (!victim || p.meta.firstSeenTs < victim.meta.firstSeenTs) victim = p;
+      }
+      if (!victim) {
+        try {
+          ws.close(1013, 'server busy');
+        } catch {}
+        return;
+      }
+      logPortfolioHeartbeat('conn', 'handshake-displaced', {
+        victim: victim.id,
+        victimIp: victim.meta.remoteIp || null,
+      });
+      closePeer(victim, 1013, 'displaced by new handshake');
+    }
+
     const id = `peer-${randId()}`;
-    const remoteIp = (req as any)?.socket?.remoteAddress ? String((req as any).socket.remoteAddress) : undefined;
     const userAgent = req?.headers?.['user-agent'] ? String(req.headers['user-agent']) : undefined;
-    const sess = new PeerSession({ id, ws, burst: cfg.submitBurst, ratePerSec: cfg.submitRatePerSec, remoteIp, userAgent });
+    const sess = new PeerSession({ id, ws, burst: cfg.submitBurst, ratePerSec: cfg.submitRatePerSec, remoteIp: remoteIp || undefined, userAgent });
     sessions.set(id, sess);
     peers.add(sess);
+    perIpCounts.set(ipKey, (perIpCounts.get(ipKey) || 0) + 1);
 
     let pc: any = null;
     // H3c: per-session rate limit for full tape re-reads.
@@ -1003,6 +1116,8 @@ async function main() {
     };
 
     const cleanup = async () => {
+      // Single-run guard: 'error' is often followed by 'close'.
+      if (!sessions.has(id)) return;
       try {
         sess.dc?.close();
       } catch {}
@@ -1011,13 +1126,16 @@ async function main() {
         pc?.close?.();
       } catch {}
       pc = null;
+      const ipKey = (sess.meta.remoteIp || 'unknown');
+      const remaining = (perIpCounts.get(ipKey) || 1) - 1;
+      if (remaining > 0) perIpCounts.set(ipKey, remaining);
+      else perIpCounts.delete(ipKey);
       sessions.delete(id);
       peers.delete(sess);
       rpcAdvertisements.delete(sess);
       for (const [pendingKey, pending] of Array.from(pendingRpc.entries())) {
         if (pending.requester !== sess && pending.provider !== sess) continue;
-        clearTimeout(pending.timer);
-        pendingRpc.delete(pendingKey);
+        releasePending(pendingKey);
         const res: RpcResponseV1 = {
           id: pending.wireId,
           ok: false,
@@ -1177,14 +1295,17 @@ async function main() {
               }
 
               if (wm.t === 'TAPE_SUB') {
+                // Register the live subscription first: the rate limit below
+                // only guards the full tape *replay* — returning early must
+                // never silently drop the client's live feed.
+                sess.wantsTape = true;
                 // H3c: rate-limit full tape re-reads per session.
                 const nowTs = Date.now();
                 if (nowTs - lastTapeSubTs < TAPE_SUB_MIN_INTERVAL_MS) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent' });
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed' });
                   return;
                 }
                 lastTapeSubTs = nowTs;
-                sess.wantsTape = true;
                 const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
                 const lastSeq = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
                 // Optional end marker; wallets that don't understand it should ignore.
@@ -1210,17 +1331,19 @@ async function main() {
                   sess.sendDc({ t: 'ERR', v: 1, code: 'bad_sig', msg: 'sigTrader verify failed' });
                   return;
                 }
-                // C1: bind sigTrader to the order content. orderId must be the
-                // canonical derivation over body/traderPubKey/clientNonce
-                // (TL-Canon v1); otherwise a harvested (orderId, sigTrader,
-                // traderPubKey) triple could be replayed with an arbitrary body.
-                const expectedOrderId = computeOrderId(order.body, order.traderPubKey, order.clientNonce);
+                // C1: bind sigTrader to the whole envelope. orderId must be the
+                // canonical derivation over every envelope field except
+                // orderId/sigTrader (TL-Canon v1) — including kind,
+                // cancelsOrderId and replacesOrderId — otherwise a harvested
+                // (orderId, sigTrader, traderPubKey, body) could be replayed
+                // with a forged CANCEL/REPLACE after a collator restart.
+                const expectedOrderId = computeEnvelopeHash(order);
                 if (order.orderId !== expectedOrderId) {
                   sess.sendDc({
                     t: 'ERR',
                     v: 1,
                     code: 'bad_order_id',
-                    msg: 'orderId must equal sha256(stableStringify(body) + traderPubKey + clientNonce), lowercase hex',
+                    msg: 'orderId must equal sha256(stableStringify(envelope minus orderId/sigTrader)), lowercase hex',
                   });
                   return;
                 }

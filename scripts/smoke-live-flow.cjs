@@ -74,9 +74,13 @@ function sha256Hex(s) {
 
 function canonicalize(v) {
   if (Array.isArray(v)) return v.map(canonicalize);
-  if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) {
-    const out = {};
-    for (const k of Object.keys(v).sort()) out[k] = canonicalize(v[k]);
+  if (v && typeof v === 'object' && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) {
+    // Own-key-safe (TL-Canon v1): keys like `__proto__` become ordinary own
+    // keys instead of triggering the Object.prototype setter.
+    const out = Object.create(null);
+    for (const k of Object.keys(v).sort()) {
+      Object.defineProperty(out, k, { value: canonicalize(v[k]), enumerable: true, writable: true, configurable: true });
+    }
     return out;
   }
   return v;
@@ -219,9 +223,13 @@ function buildOrder(market, side, px, qty) {
     clientTs: Date.now(),
   };
   const clientNonce = crypto.randomBytes(16).toString('hex');
-  const orderId = sha256Hex(stableStringify(body) + traderPubKey + clientNonce);
+  // TL-Canon v1 envelope binding (BREAKING): orderId is derived over every
+  // envelope field except orderId/sigTrader — including kind, cancelsOrderId
+  // and replacesOrderId.
+  const signed = { v: 1, kind: 'NEW', body, traderPubKey, clientNonce };
+  const orderId = sha256Hex(stableStringify(signed));
   const sigTrader = Buffer.from(ecc.sign(Buffer.from(orderId, 'hex'), priv)).toString('hex');
-  return { v: 1, kind: 'NEW', body, traderPubKey, clientNonce, orderId, sigTrader };
+  return { ...signed, orderId, sigTrader };
 }
 
 async function waitForOrderEcho(peer, orderId, timeoutMs) {

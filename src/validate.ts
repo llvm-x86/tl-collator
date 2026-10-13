@@ -1,4 +1,5 @@
 import type { OrderEnvelopeV1, WireMsg } from './types.js';
+import { findUnsafeKey } from './canonical.js';
 
 export function isWireMsg(x: any): x is WireMsg {
   return !!x && typeof x === 'object' && typeof x.t === 'string' && typeof x.v === 'number';
@@ -6,6 +7,8 @@ export function isWireMsg(x: any): x is WireMsg {
 
 export function validateOrderEnvelope(o: any): o is OrderEnvelopeV1 {
   if (!o || typeof o !== 'object') return false;
+  // Reject prototype-pollution keys anywhere in the envelope (incl. body/visibility).
+  if (findUnsafeKey(o) !== null) return false;
   if (o.v !== 1) return false;
   if (!['NEW', 'CANCEL', 'REPLACE'].includes(o.kind)) return false;
   if (!o.body || typeof o.body !== 'object' || o.body.v !== 1) return false;

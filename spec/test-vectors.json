@@ -1,17 +1,44 @@
 {
   "orderTest": {
-    "orderBody": {
+    "envelopeNoSig": {
       "v": 1,
-      "market": "SPOT:LTC/USDT",
-      "side": "BUY",
-      "px": "72.50",
-      "qty": "10.0",
-      "visibility": { "kind": "PUBLIC" },
-      "clientTs": 1700000000000
+      "kind": "NEW",
+      "body": {
+        "v": 1,
+        "market": "SPOT:LTC/USDT",
+        "side": "BUY",
+        "px": "72.50",
+        "qty": "10.0",
+        "visibility": {
+          "kind": "PUBLIC"
+        },
+        "clientTs": 1700000000000
+      },
+      "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef"
     },
-    "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef",
-    "expectedOrderId": "b5c838846680e61c59dc583b7597034869f121cfc29ec19c5765dc931e492025"
+    "expectedOrderId": "64496beee789330938912bb4fbef934e4dcb6bd3eabfe50d6a2786cd4fde71b4"
+  },
+  "orderCancelTest": {
+    "envelopeNoSig": {
+      "v": 1,
+      "kind": "CANCEL",
+      "body": {
+        "v": 1,
+        "market": "SPOT:LTC/USDT",
+        "side": "BUY",
+        "px": "72.50",
+        "qty": "10.0",
+        "visibility": {
+          "kind": "PUBLIC"
+        },
+        "clientTs": 1700000000000
+      },
+      "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "cancelsOrderId": "64496beee789330938912bb4fbef934e4dcb6bd3eabfe50d6a2786cd4fde71b4"
+    },
+    "expectedOrderId": "2f82c9f20f423031bfcbcb46ba7c7d386f347c18df3951a941d899c9daf6b113"
   },
   "tapeTest": {
     "entryNoSig": {
@@ -29,17 +56,18 @@
           "side": "BUY",
           "px": "72.50",
           "qty": "10.0",
-          "visibility": { "kind": "PUBLIC" },
+          "visibility": {
+            "kind": "PUBLIC"
+          },
           "clientTs": 1700000000000
         },
-        "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "traderPubKey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "clientNonce": "deadbeefdeadbeefdeadbeefdeadbeef",
-        "orderId": "b5c838846680e61c59dc583b7597034869f121cfc29ec19c5765dc931e492025",
+        "orderId": "64496beee789330938912bb4fbef934e4dcb6bd3eabfe50d6a2786cd4fde71b4",
         "sigTrader": "00"
       }
     },
-    "expectedEntryHash": "270702d95819b9ae5b5d8ca97e6371f38d143d6ecba9037ece4083e7ae7139f2",
-    "expectedSigPayloadHash": "d8d10c498452b5970950d9600eec8b48d5385e47571cb4801ce9fc901068a1fa"
+    "expectedEntryHash": "185ac10f5bf02c6bac74b0621843d2d4584e39d0fb8538079e0c93657f4b625a",
+    "expectedSigPayloadHash": "ee95534105c21cbe2f99d3904123fcc8669cafeb509be1e8ec79fb3da43dbd9e"
   }
 }
-

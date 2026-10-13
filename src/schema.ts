@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 
 import type { SignalMsg, WireMsg } from './types.js';
 import type { OrderEnvelopeV1 } from './types.js';
+import { findUnsafeKey } from './canonical.js';
 
 export interface SchemaValidators {
   validateSignalMsg: (x: any) => x is SignalMsg;
@@ -63,6 +64,14 @@ export function loadValidators(): SchemaValidators {
       return ok;
     },
     validateOrderEnvelope: (x: any): x is OrderEnvelopeV1 => {
+      // Reject prototype-pollution keys anywhere in the envelope (incl.
+      // body/visibility) before schema validation: `__proto__`/`constructor`/
+      // `prototype` must never reach hashing or downstream object handling.
+      const unsafe = findUnsafeKey(x);
+      if (unsafe !== null) {
+        lastErrors = [{ instancePath: '', message: `unsafe key not allowed: ${unsafe}`, params: { unsafeKey: unsafe } }];
+        return false;
+      }
       const ok = !!vOrder(x);
       lastErrors = ok ? null : (vOrder.errors || null);
       return ok;

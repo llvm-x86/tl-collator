@@ -56,7 +56,11 @@ keep working without changing its base URL:
 
 Note: all legacy relayer proxy routes are **disabled by default** and require
 `LEGACY_PROXY_ENABLED=1` (see Configure). Routes that have a WebRTC-routed RPC
-fallback transparently use the allowlisted routed path while the proxy is off.
+fallback transparently use the allowlisted routed path while the proxy is off —
+`GET /chain/info` → `getblockchaininfo`, `GET /address/validate/:address` →
+`validateaddress`, `POST /address/utxo/:address` → `listunspent`, and
+`POST /tx/decode` → `decoderawtransaction` are all on the public RPC allowlist
+for exactly this reason.
 
 ## Order submission and `orderId` derivation
 
@@ -64,17 +68,32 @@ fallback transparently use the allowlisted routed path while the proxy is off.
 `spec/schemas/tl-canon-v1.md`):
 
 ```
-orderId   = sha256(stableStringify(body) + traderPubKey + clientNonce)   (lowercase hex)
+orderId   = sha256(stableStringify(envelope minus orderId/sigTrader))   (lowercase hex)
 sigTrader = secp256k1 compact signature (64 bytes hex) over the 32 raw bytes of orderId
 ```
 
-The collator verifies `sigTrader` over `orderId` **and** rejects any envelope
-whose `orderId` does not match the canonical derivation (`ERR` code
-`bad_order_id`). This binds the trader signature to the order content, so a
-harvested `(orderId, sigTrader, traderPubKey)` triple can never be replayed
-with a different `body`. Clients that computed `orderId` differently must adopt
-this convention (identical to `scripts/smoke-live-flow.cjs`). Worked test
-vectors: `spec/test-vectors.json` (checked by `npm test`).
+That is, `orderId` is derived over **every envelope field except `orderId` and
+`sigTrader`** — `v`, `kind`, `body`, `traderPubKey`, `clientNonce`, and
+`cancelsOrderId` / `replacesOrderId` when present. The collator verifies
+`sigTrader` over `orderId` **and** rejects any envelope whose `orderId` does
+not match the canonical derivation (`ERR` code `bad_order_id`). This binds the
+trader signature to the complete order intent: a harvested
+`(orderId, sigTrader, traderPubKey)` triple can never be replayed with a
+different `body`, and a tape-harvested `NEW` order can never be re-submitted as
+a forged `CANCEL`/`REPLACE` of another trader's order.
+
+⚠️ **BREAKING:** an earlier revision of this PR derived `orderId` from `body`
+alone (`sha256(stableStringify(body) + traderPubKey + clientNonce)`), leaving
+`kind`/`cancelsOrderId`/`replacesOrderId` outside the signature. Clients must
+adopt the envelope-hash convention above (identical to
+`scripts/smoke-live-flow.cjs`). Envelopes derived the old way are rejected with
+`bad_order_id`. Worked test vectors: `spec/test-vectors.json` (checked by
+`npm test`).
+
+Envelopes carrying `__proto__`, `constructor` or `prototype` keys anywhere
+(including inside `body`/`visibility`) are rejected as schema-invalid; the
+canonicalizer hashes such keys as ordinary own keys and never treats them as
+prototypes.
 
 ## Configure
 
@@ -93,6 +112,10 @@ Environment variables:
 - `SEEN_ORDERIDS_MAX` (default: `100000`)
 - `NAME`, `OPERATOR`, `REGION` (optional manifest fields)
 - `CONN_MAX` (hard cap on concurrent WS connections, default `256`; set `0` to disable the cap)
+- `CONN_MAX_PER_IP` (default `16`; per-IP sub-cap on concurrent WS connections; `0` disables) — one source cannot hold a large share of the pool
+- `CONN_IDLE_TIMEOUT_MS` (default `60000`): sessions with no open DataChannel and no traffic for this long are closed (WS `1013`)
+- `CONN_SWEEP_INTERVAL_MS` (default `15000`): idle-reaper sweep interval
+- `CONN_HANDSHAKE_GRACE_MS` (default `5000`): fresh connections younger than this are never displaced by the handshake reserve; when `CONN_MAX` is reached, new handshakes displace the oldest silent (no-DataChannel) session instead of being refused — only a pool of fully-established sessions returns `1013`
 - `CLEARLIST_ENFORCE` (`0|1`, default `0`)
 - `CLEARLIST_URL` (required if `CLEARLIST_ENFORCE=1`; expects `POST /clearlist/check`)
 - `CLEARLIST_FAIL_MODE` (`closed|open`, default `closed`)
@@ -107,17 +130,18 @@ Environment variables:
 - `TL_WALLET_LISTENER_URL` is also honored as the upstream fallback for legacy listener routes
 - `LEGACY_PROXY_ENABLED` (`0|1`, default `0`): master switch for all legacy relayer proxy routes (`/address/*`, `/tx/*`, `/token/*`, `/chain/info`, `/rpc/:method` fallback, `/attestation/ip` forwarding, `/tl_*`). Off by default because these paths bypass the public RPC allowlist. Enable only for a trusted local relayer.
 - `LEGACY_PROXY_FAUCET` (`0|1`, default `0`): additionally required to proxy `GET /address/faucet/:address`. This is a fund-moving endpoint — never enable it on an untrusted network.
-- `TRUST_PROXY` (`0|1`, default `0`): only trust `cf-connecting-ip`/`x-real-ip`/`x-forwarded-for` headers when deployed behind a trusted proxy. Off by default so the socket peer address is used and IP headers cannot be spoofed for `/attestation/ip`.
+- `TRUST_PROXY` (`0|1`, default `0`): only trust client-IP headers when deployed behind a trusted reverse proxy. **Reverse-proxy deployments must set `TRUST_PROXY=1`** — otherwise the socket peer address (the proxy's) is used. With `TRUST_PROXY=1`, `cf-connecting-ip`/`x-real-ip` win over `x-forwarded-for`, and XFF is resolved to its **rightmost** hop (the entry appended by the nearest trusted proxy); the leftmost entries are client-controlled and are never trusted. Determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
 - `PENDING_RPC_MAX` (default `1000`): cap on concurrent in-flight routed RPC requests.
+- `PENDING_RPC_MAX_PER_SESSION` (default `32`, `0` disables): per-session cap on outstanding routed RPC requests, so one requester (or a colluding pair with a pinned provider) cannot fill the global pool and starve other callers.
 - `TL_COLLATOR_RPC_SERVICE` / `TL_COLLATOR_RPC_NETWORK` tune routed RPC matching
 
 ### Security defaults
 
 - Legacy relayer proxy is **disabled** unless `LEGACY_PROXY_ENABLED=1`; the faucet path additionally requires `LEGACY_PROXY_FAUCET=1`.
 - Client IP is taken from the socket unless `TRUST_PROXY=1`; determined IPs are validated with `net.isIP` before use in `/attestation/ip`.
-- Concurrent WS connections are capped by `CONN_MAX` (default `256`).
-- Each `SIGNAL_OFFER` closes/replaces the session's previous `RTCPeerConnection`; `TAPE_SUB` full re-reads are rate-limited to one per second per session.
-- `RPC_RES` is only accepted from the session the request was routed to; pending routed RPCs are namespaced per provider session and capped by `PENDING_RPC_MAX`.
+- Concurrent WS connections are capped by `CONN_MAX` (default `256`) and `CONN_MAX_PER_IP` (default `16`); silent (no-DataChannel) sessions idle for `CONN_IDLE_TIMEOUT_MS` (default 60 s) are reaped, and when the pool is full a fresh handshake displaces the oldest silent session (handshake reserve) instead of locking everyone out with `1013`.
+- Each `SIGNAL_OFFER` closes/replaces the session's previous `RTCPeerConnection`; `TAPE_SUB` full re-reads are rate-limited to one per second per session — a rate-limited `TAPE_SUB` keeps the live subscription active and only skips the replay.
+- `RPC_RES` is only accepted from the session the request was routed to; pending routed RPCs are namespaced per provider session, capped globally by `PENDING_RPC_MAX` and per requesting session by `PENDING_RPC_MAX_PER_SESSION`.
 - The generated collator key file is written with mode `0600`.
 
 Infra attestations (optional; used by wallets for curated-mode acceptability):
