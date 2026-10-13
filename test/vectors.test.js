@@ -4,39 +4,45 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { computeEnvelopeHash, computeOrderId, envelopeSignedFields, stableStringify } from '../dist/canonical.js';
 import { sha256Hex } from '../dist/crypto.js';
 import { TapeStore } from '../dist/tape.js';
 import { loadValidators } from '../dist/schema.js';
-import { validateOrderEnvelope } from '../dist/validate.js';
 
 const vectorsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'spec', 'test-vectors.json');
 const vectors = JSON.parse(fs.readFileSync(vectorsPath, 'utf8'));
+// The standalone scripts' serializer must agree with the spec as well.
+const scriptCanon = createRequire(import.meta.url)('../scripts/lib/tl-canon.cjs');
 
-// Independent re-implementation of the wallet/smoke-script convention
-// (scripts/smoke-live-flow.cjs buildOrder, TL-Canon v1 envelope binding):
-//   orderId = sha256(stableStringify(envelope minus orderId/sigTrader))
+// Independent re-implementation of the TL-Canon v1 convention used by the
+// smoke clients (scripts/smoke-live-flow.cjs buildOrder): code-point key order,
+// keys written by hand (JSON.stringify would hoist integer-like keys).
+const codePoints = (str) => Array.from(str, (c) => c.codePointAt(0));
+const compareCodePoints = (a, b) => {
+  const x = codePoints(a);
+  const y = codePoints(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return x.length - y.length;
+};
+function canonicalText(v) {
+  if (Array.isArray(v)) return `[${v.map(canonicalText).join(',')}]`;
+  if (v && typeof v === 'object') {
+    // Own-key-safe: `__proto__` is an ordinary key, read as an own data property.
+    const keys = Object.keys(v).sort(compareCodePoints);
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalText(v[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
 function smokeStyleOrderId(envelope) {
-  const canonicalize = (v) => {
-    if (Array.isArray(v)) return v.map(canonicalize);
-    if (v && typeof v === 'object' && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) {
-      // Own-key-safe: `__proto__` must become an ordinary own key.
-      const out = Object.create(null);
-      for (const k of Object.keys(v).sort()) {
-        Object.defineProperty(out, k, { value: canonicalize(v[k]), enumerable: true, writable: true, configurable: true });
-      }
-      return out;
-    }
-    return v;
-  };
   const signed = {};
   for (const k of Object.keys(envelope)) {
     if (k === 'orderId' || k === 'sigTrader') continue;
     Object.defineProperty(signed, k, { value: envelope[k], enumerable: true, writable: true, configurable: true });
   }
-  return crypto.createHash('sha256').update(JSON.stringify(canonicalize(signed)), 'utf8').digest('hex');
+  return crypto.createHash('sha256').update(canonicalText(signed), 'utf8').digest('hex');
 }
 
 test('C1: spec vector orderId matches the envelope-hash derivation', () => {
@@ -127,17 +133,69 @@ test('validation: __proto__/constructor/prototype keys are rejected anywhere in 
     const badTop = JSON.parse(JSON.stringify(envelope));
     Object.defineProperty(badTop, key, { value: { pwned: 1 }, enumerable: true, writable: true, configurable: true });
     assert.equal(validators.validateOrderEnvelope(badTop), false, `top-level ${key} must be rejected`);
-    assert.equal(validateOrderEnvelope(badTop), false, `top-level ${key} must be rejected (hand-rolled)`);
 
     const badNested = JSON.parse(JSON.stringify(envelope));
     badNested.body.visibility = JSON.parse(`{"kind":"PUBLIC","${key}":{"pwned":1}}`);
     assert.equal(validators.validateOrderEnvelope(badNested), false, `nested ${key} must be rejected`);
-    assert.equal(validateOrderEnvelope(badNested), false, `nested ${key} must be rejected (hand-rolled)`);
   }
 
   // Sanity: the clean envelope still validates.
   assert.equal(validators.validateOrderEnvelope(envelope), true);
-  assert.equal(validateOrderEnvelope(envelope), true);
+});
+
+test('validation: values TL-Canon cannot represent are rejected before hashing', () => {
+  const validators = loadValidators();
+  const base = { ...vectors.orderTest.envelopeNoSig, orderId: 'ab'.repeat(32), sigTrader: '11'.repeat(64) };
+  const clone = () => JSON.parse(JSON.stringify(base));
+  const cases = {
+    'clientTs above 2^53-1': (e) => { e.body.clientTs = Number.MAX_SAFE_INTEGER + 1; },
+    'clientTs fractional': (e) => { e.body.clientTs = 1.5; },
+    'expiryTs out of range': (e) => { e.body.expiryTs = 1e300; },
+    'nested fractional number in open body': (e) => { e.body.extra = { x: 0.5 }; },
+    'nested out-of-range number in open body': (e) => { e.body.extra = [1, 1e300]; },
+    'lone surrogate in a string value': (e) => { e.body.market = 'SPOT:\ud800'; },
+    'lone surrogate in a key': (e) => { e.body.extra = JSON.parse('{"\\udc00":1}'); },
+  };
+  for (const [name, mutate] of Object.entries(cases)) {
+    const env = clone();
+    mutate(env);
+    assert.equal(validators.validateOrderEnvelope(env), false, name);
+  }
+  assert.equal(validators.validateOrderEnvelope(clone()), true);
+});
+
+test('TL-Canon: integer-like, astral and integral-number vectors match the spec', () => {
+  const ik = vectors.integerKeyTest;
+  assert.equal(stableStringify(ik.input), ik.expectedCanonical);
+  assert.equal(sha256Hex(stableStringify(ik.input)), ik.expectedSha256);
+  // The batch-1 JSON.stringify ordering produces a different digest for this vector.
+  assert.notEqual(sha256Hex(JSON.stringify(ik.input)), ik.expectedSha256);
+  assert.equal(computeEnvelopeHash(vectors.orderIntegerKeyTest.envelopeNoSig), vectors.orderIntegerKeyTest.expectedOrderId);
+
+  const uk = vectors.unicodeKeyOrderTest;
+  assert.equal(stableStringify(uk.input), uk.expectedCanonical);
+  assert.equal(sha256Hex(stableStringify(uk.input)), uk.expectedSha256);
+
+  assert.equal(stableStringify(vectors.integralNumberTest.input), vectors.integralNumberTest.expectedCanonical);
+});
+
+test('TL-Canon: every rejectTests input is refused, never serialized', () => {
+  for (const c of vectors.rejectTests) {
+    assert.throws(() => stableStringify(c.input), TypeError, c.name);
+  }
+});
+
+test('TL-Canon: scripts/lib/tl-canon.cjs matches every serialization vector and rejects the same inputs', () => {
+  assert.equal(scriptCanon.stableStringify(vectors.integerKeyTest.input), vectors.integerKeyTest.expectedCanonical);
+  assert.equal(scriptCanon.stableStringify(vectors.unicodeKeyOrderTest.input), vectors.unicodeKeyOrderTest.expectedCanonical);
+  assert.equal(scriptCanon.stableStringify(vectors.integralNumberTest.input), vectors.integralNumberTest.expectedCanonical);
+  assert.equal(
+    sha256Hex(scriptCanon.stableStringify(vectors.orderIntegerKeyTest.envelopeNoSig)),
+    vectors.orderIntegerKeyTest.expectedOrderId,
+  );
+  for (const c of vectors.rejectTests) {
+    assert.throws(() => scriptCanon.stableStringify(c.input), TypeError, c.name);
+  }
 });
 
 test('tape vectors: entryHash and collator sig payload hash match spec', () => {
@@ -148,6 +206,7 @@ test('tape vectors: entryHash and collator sig payload hash match spec', () => {
     idxPath: path.join(dir, 'tape.idx'),
     idxStride: 10,
     replayBatch: 10,
+    maxReplayEntries: 1000,
     collatorId: base.collatorId,
     collatorPrivKeyHex: '22'.repeat(32),
   });

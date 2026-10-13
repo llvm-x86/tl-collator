@@ -1,10 +1,10 @@
 import { sha256Hex } from './crypto.js';
 
-// Unsafe object keys: assignment of `__proto__` on a plain object triggers the
-// prototype setter (dropping the key and mutating the prototype), and
-// `constructor`/`prototype` are the other classic pollution vectors. The
-// canonicalizer below never interprets keys as accessors (own-key-safe), and
-// the schema/validation layer rejects envelopes carrying these keys outright.
+// Keys rejected by the validation layer (schema.ts) wherever an OrderEnvelopeV1
+// is accepted: assignment of `__proto__` on a plain object triggers the
+// prototype setter, and `constructor`/`prototype` are the other classic
+// pollution vectors. The serializer below does NOT interpret keys as accessors
+// and serializes these as ordinary own keys (see spec/schemas/tl-canon-v1.md).
 export const UNSAFE_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -13,50 +13,96 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-// Recursively find unsafe keys (`__proto__`/`constructor`/`prototype`).
-export function findUnsafeKey(v: unknown): string | null {
+// TL-Canon v1 domain checks, shared by the serializer and the validation walker.
+// Numbers must be safe integers; strings must be well-formed Unicode (no lone
+// UTF-16 surrogates, which have no UTF-8 encoding).
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+function scalarViolation(v: unknown): string | null {
+  if (typeof v === 'number') return Number.isSafeInteger(v) ? null : 'number is not a safe integer';
+  if (typeof v === 'string') return LONE_SURROGATE.test(v) ? 'string is not well-formed Unicode' : null;
+  return null;
+}
+
+/**
+ * Validation walker: returns a reason for the first value or key that TL-Canon
+ * v1 cannot represent (unsafe key, non-safe-integer number, lone surrogate), or
+ * null. Used by schema.ts to reject envelopes before hashing or storing them.
+ */
+export function findCanonicalViolation(v: unknown): string | null {
+  const scalar = scalarViolation(v);
+  if (scalar) return scalar;
   if (Array.isArray(v)) {
     for (const item of v) {
-      const hit = findUnsafeKey(item);
+      const hit = findCanonicalViolation(item);
       if (hit) return hit;
     }
     return null;
   }
   if (isPlainObject(v)) {
     for (const k of Object.keys(v)) {
-      if (UNSAFE_KEYS.has(k)) return k;
-      const hit = findUnsafeKey((v as Record<string, unknown>)[k]);
+      if (UNSAFE_KEYS.has(k)) return `unsafe key not allowed: ${k}`;
+      const keyProblem = scalarViolation(k);
+      if (keyProblem) return `key ${keyProblem}`;
+      const hit = findCanonicalViolation(v[k]);
       if (hit) return hit;
     }
   }
   return null;
 }
 
-function canonicalizeValue(v: any): any {
-  if (v === null) return null;
-  if (Array.isArray(v)) return v.map(canonicalizeValue);
-  if (isPlainObject(v)) {
-    // Build the canonical object with a null prototype and defineProperty so
-    // keys like `__proto__` become ordinary own keys instead of triggering the
-    // Object.prototype setter (which silently dropped them and caused hash
-    // collisions / prototype pollution).
-    const out: Record<string, any> = Object.create(null);
-    const keys = Object.keys(v).sort();
-    for (const k of keys) {
-      Object.defineProperty(out, k, {
-        value: canonicalizeValue(v[k]),
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
-    }
-    return out;
+// TL-Canon v1 key order: ascending Unicode **code point** (shortest prefix
+// first) — NOT `JSON.stringify` object order. JSON.stringify emits
+// integer-like keys ("9", "10", ...) first in numeric order, which silently
+// diverges from the spec and made non-JS clients derive different orderIds
+// (`bad_order_id`). A plain `Array.prototype.sort()` (UTF-16 code-unit order)
+// would also diverge for astral-plane keys, so we compare code points.
+// Matches Python's `sorted(str)`.
+function compareCodePoints(a: string, b: string): number {
+  const ai = Array.from(a, (ch) => ch.codePointAt(0) as number);
+  const bi = Array.from(b, (ch) => ch.codePointAt(0) as number);
+  const n = Math.min(ai.length, bi.length);
+  for (let i = 0; i < n; i++) {
+    if (ai[i] !== bi[i]) return ai[i] - bi[i];
   }
-  return v;
+  return ai.length - bi.length;
+}
+
+// Recursive TL-Canon v1 serialization. Returns `undefined` for values JSON
+// omits (`undefined` / functions / symbols) so object keys carrying them are
+// dropped (spec: "omit keys whose value is undefined").
+function serializeCanonical(v: unknown): string | undefined {
+  if (v === null) return 'null';
+  const t = typeof v;
+  if (t === 'number' || t === 'string') {
+    const problem = scalarViolation(v);
+    if (problem) throw new TypeError(`TL-Canon: ${problem}`);
+    return JSON.stringify(v);
+  }
+  if (t === 'boolean') return JSON.stringify(v);
+  if (t === 'undefined' || t === 'function' || t === 'symbol') return undefined;
+  if (Array.isArray(v)) return `[${Array.from(v, (item) => serializeCanonical(item) ?? 'null').join(',')}]`;
+  if (isPlainObject(v)) {
+    // Own enumerable keys only, in code-point order; values are read from
+    // property descriptors so accessor properties are never invoked and a key
+    // like `__proto__` is serialized as an ordinary own key.
+    const parts: string[] = [];
+    for (const k of Object.keys(v).sort(compareCodePoints)) {
+      const problem = scalarViolation(k);
+      if (problem) throw new TypeError(`TL-Canon: key ${problem}`);
+      const desc = Object.getOwnPropertyDescriptor(v, k);
+      if (!desc || !('value' in desc)) continue;
+      const s = serializeCanonical(desc.value);
+      if (s === undefined) continue;
+      parts.push(`${JSON.stringify(k)}:${s}`);
+    }
+    return `{${parts.join(',')}}`;
+  }
+  return JSON.stringify(v);
 }
 
 export function stableStringify(v: unknown): string {
-  return JSON.stringify(canonicalizeValue(v));
+  return serializeCanonical(v) ?? 'null';
 }
 
 /**
@@ -91,11 +137,16 @@ export function envelopeSignedFields(envelope: unknown): Record<string, unknown>
  * binds `kind`, `cancelsOrderId` and `replacesOrderId` into the trader
  * signature, so a harvested `(orderId, sigTrader, traderPubKey, body)` from the
  * tape can never be re-submitted as a forged CANCEL/REPLACE. The digest is
- * lowercase hex.
+ * lowercase hex. Throws if the envelope holds a value TL-Canon cannot
+ * represent; callers validate with `findCanonicalViolation` first.
  *
  * NOTE (BREAKING): this supersedes the batch-1 body-only derivation
  * `sha256(stableStringify(body) + traderPubKey + clientNonce)`. Clients must
  * adopt this convention (identical to scripts/smoke-live-flow.cjs buildOrder).
+ *
+ * NOTE (BREAKING): object keys are emitted in Unicode code-point
+ * order. Envelopes whose signed fields contain integer-like keys ("9", "10")
+ * or astral-plane keys hash differently than under the batch-1 serializer.
  */
 export function computeEnvelopeHash(envelope: unknown): string {
   return sha256Hex(stableStringify(envelopeSignedFields(envelope)));

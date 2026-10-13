@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const ecc = require('tiny-secp256k1');
+const { stableStringify } = require('./lib/tl-canon.cjs');
 
 function usage() {
   console.log(
@@ -54,20 +55,7 @@ function sha256HexUtf8(s) {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 }
 
-function canonicalize(v) {
-  if (v === null) return null;
-  if (Array.isArray(v)) return v.map(canonicalize);
-  if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) {
-    const out = {};
-    for (const k of Object.keys(v).sort()) out[k] = canonicalize(v[k]);
-    return out;
-  }
-  return v;
-}
 
-function stableStringify(v) {
-  return JSON.stringify(canonicalize(v));
-}
 
 function readPrivHex(rawOrPath) {
   const raw = String(rawOrPath || '').trim();

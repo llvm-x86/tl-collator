@@ -6,6 +6,7 @@ const https = require('node:https');
 const ecc = require('tiny-secp256k1');
 const wrtc = require('wrtc');
 const WS = require('ws');
+const { stableStringify } = require('./lib/tl-canon.cjs');
 
 global.RTCPeerConnection = wrtc.RTCPeerConnection;
 
@@ -72,23 +73,7 @@ function sha256Hex(s) {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 }
 
-function canonicalize(v) {
-  if (Array.isArray(v)) return v.map(canonicalize);
-  if (v && typeof v === 'object' && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) {
-    // Own-key-safe (TL-Canon v1): keys like `__proto__` become ordinary own
-    // keys instead of triggering the Object.prototype setter.
-    const out = Object.create(null);
-    for (const k of Object.keys(v).sort()) {
-      Object.defineProperty(out, k, { value: canonicalize(v[k]), enumerable: true, writable: true, configurable: true });
-    }
-    return out;
-  }
-  return v;
-}
 
-function stableStringify(v) {
-  return JSON.stringify(canonicalize(v));
-}
 
 async function waitForProvider(baseUrl, service, network, timeoutMs) {
   const deadline = Date.now() + timeoutMs;

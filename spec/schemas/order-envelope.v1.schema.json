@@ -20,7 +20,7 @@
         "px": { "type": "string" },
         "qty": { "type": "string" },
         "tif": { "enum": ["GTC", "IOC", "FOK"] },
-        "expiryTs": { "type": "number" },
+        "expiryTs": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
         "visibility": {
           "oneOf": [
             {
@@ -47,7 +47,7 @@
           ]
         },
         "clearlistTag": { "type": "string" },
-        "clientTs": { "type": "number" }
+        "clientTs": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 }
       }
     },
     "traderPubKey": { "type": "string", "pattern": "^[0-9a-fA-F]+$" },
