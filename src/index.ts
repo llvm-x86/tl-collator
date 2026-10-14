@@ -14,8 +14,7 @@ import { computeEnvelopeHash } from './canonical.js';
 import { TapeStore } from './tape.js';
 import { PeerSession } from './peerSession.js';
 import { isWireMsg } from './validate.js';
-import { LruMap } from './lru.js';
-import { ConcurrencyCounter, MinIntervalGate, TokenBucket } from './ratelimit.js';
+import { ConcurrencyCounter, KeyedTokenBuckets, MinIntervalGate, TokenBucket } from './ratelimit.js';
 import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
@@ -73,6 +72,8 @@ function normalizeRpcMethod(method: unknown): string {
 
 // Minimum interval between full TAPE_SUB tape re-reads per session (H3).
 const TAPE_SUB_MIN_INTERVAL_MS = 1000;
+// Bound on tracked per-client HTTP buckets (see KeyedTokenBuckets).
+const HTTP_BUCKET_TABLE_MAX = 5000;
 
 function isPublicRpcMethod(method: unknown): boolean {
   return PUBLIC_RPC_METHODS.has(normalizeRpcMethod(method));
@@ -273,8 +274,21 @@ async function main() {
   // multiply its share; the IP cap closes that.
   const rpcAdmission = new ConcurrencyCounter();
   const sessionAdmissionKey = (sessionId: string): string => `sess:${sessionId}`;
-  // Per-client-IP token buckets for HTTP-routed RPCs; see routeRpcRequest.
-  const httpRpcBuckets = new LruMap<TokenBucket>(5000);
+  // The one limiter identity: every per-client budget, cap and aggregation below
+  // keys on this (IPv6 collapsed to its prefix), never on the raw address.
+  const clientKey = (ip: string): string => clientKeyForIp(ip, cfg.clientIpv6PrefixLen);
+  // Per-client token buckets for HTTP entry points (bounded; see httpRpcAllowed).
+  const httpRpcBuckets = new KeyedTokenBuckets({
+    capacity: cfg.httpRpcPerIpBurst,
+    refillPerSec: cfg.httpRpcPerIpRps,
+    maxKeys: HTTP_BUCKET_TABLE_MAX,
+  });
+  // Optional all-clients backstop, charged only after the per-client bucket admits.
+  const httpRpcGlobal = cfg.httpRpcGlobalRps > 0
+    ? new TokenBucket({ capacity: cfg.httpRpcGlobalBurst, refillPerSec: cfg.httpRpcGlobalRps })
+    : null;
+  // Logs (at most once a minute) while the bucket table is full and new clients share the overflow bucket.
+  const httpBucketOverflowGate = new MinIntervalGate(60 * 1000, 1);
   // Logs (at most once per 10 minutes) when a peer that is not a configured proxy hop
   // sends forwarding headers: the usual sign of a proxy missing from TRUST_PROXY_CIDRS,
   // which makes every client share that proxy's HTTP bucket.
@@ -354,16 +368,20 @@ async function main() {
       ? { ok: false, error: { code: 'RPC_RATE_LIMITED', message } }
       : { error: message, code: 'RPC_RATE_LIMITED' };
   };
-  // Per-client-IP token bucket for HTTP requests (HTTP_RPC_PER_IP_RPS / _BURST).
-  // Called only from the HTTP entry gate, once per request.
+  // Per-client token bucket for HTTP requests (HTTP_RPC_PER_IP_RPS / _BURST), then
+  // the optional global backstop. Called only from the HTTP entry gate, once per request.
   const httpRpcAllowed = (ip: string): boolean => {
-    const key = clientKeyForIp(ip);
-    let bucket = httpRpcBuckets.get(key);
-    if (!bucket) {
-      bucket = new TokenBucket({ capacity: cfg.httpRpcPerIpBurst, refillPerSec: cfg.httpRpcPerIpRps });
-      httpRpcBuckets.set(key, bucket);
+    const taken = httpRpcBuckets.take(clientKey(ip));
+    if (taken.overflow && httpBucketOverflowGate.allow('overflow')) {
+      console.warn(JSON.stringify({
+        service: 'tl-collator',
+        event: 'http-bucket-table-full',
+        msg: 'HTTP client bucket table is full with no refilled entry; new clients share one overflow budget until entries go idle',
+        maxKeys: HTTP_BUCKET_TABLE_MAX,
+      }));
     }
-    return bucket.allow(1);
+    if (!taken.allowed) return false;
+    return httpRpcGlobal ? httpRpcGlobal.allow(1) : true;
   };
 
   // Routed-RPC admission for one request. `caller.session` is set only for
@@ -404,7 +422,7 @@ async function main() {
     const timeoutMs = Math.max(1000, Math.min(120000, Number(rpcReq.timeoutMs || 12000)));
     // Admission: a WebSocket request is charged to its session and to its IP, an
     // HTTP request to its IP only. Each cap is checked before anything is charged.
-    const ipKey = clientKeyForIp(caller.ip);
+    const ipKey = clientKey(caller.ip);
     const sessionKey = requester ? sessionAdmissionKey(requester.id) : null;
     const admissionKeys = sessionKey ? [sessionKey, ipKey] : [ipKey];
     if (sessionKey && cfg.pendingRpcMaxPerSession > 0 && rpcAdmission.get(sessionKey) >= cfg.pendingRpcMaxPerSession) {
@@ -1146,7 +1164,7 @@ async function main() {
     // Cap by the resolved client IP, not the raw socket peer: behind a proxy the
     // socket address is the proxy's and would give every client one shared budget.
     const remoteIp = clientIpResolver.resolve(req);
-    const ipKey = remoteIp || 'unknown';
+    const ipKey = clientKey(remoteIp);
 
     // Per-IP sub-cap first: a single source must not be able to hold a large
     // fraction of the pool (keep-alive socket floods).
@@ -1204,7 +1222,7 @@ async function main() {
         pc?.close?.();
       } catch {}
       pc = null;
-      const ipKey = (sess.meta.remoteIp || 'unknown');
+      const ipKey = clientKey(sess.meta.remoteIp || '');
       const remaining = (perIpCounts.get(ipKey) || 1) - 1;
       if (remaining > 0) perIpCounts.set(ipKey, remaining);
       else perIpCounts.delete(ipKey);

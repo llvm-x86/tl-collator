@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { parseTrustedProxyConfig, type TrustedProxyConfig } from './clientIp.js';
+import {
+  CLIENT_IPV6_PREFIX_DEFAULT,
+  CLIENT_IPV6_PREFIX_MAX,
+  CLIENT_IPV6_PREFIX_MIN,
+  parseTrustedProxyConfig,
+  type TrustedProxyConfig,
+} from './clientIp.js';
 
 export interface Config {
   port: number;
@@ -34,6 +40,9 @@ export interface Config {
   tapeResyncMaxEntries: number;
   httpRpcPerIpRps: number;
   httpRpcPerIpBurst: number;
+  httpRpcGlobalRps: number;
+  httpRpcGlobalBurst: number;
+  clientIpv6PrefixLen: number;
   pendingRpcMax: number;
   rpcAdvertTtlMs: number;
   connIdleTimeoutMs: number;
@@ -155,6 +164,11 @@ export function loadConfig(): Config {
   // Per-client-IP token bucket for the unauthenticated HTTP RPC entry points.
   const httpRpcPerIpRps = intEnv('HTTP_RPC_PER_IP_RPS', 20, atLeast(1));
   const httpRpcPerIpBurst = intEnv('HTTP_RPC_PER_IP_BURST', 40, atLeast(1));
+  // Global backstop over all clients for the same HTTP entry points; 0 disables.
+  const httpRpcGlobalRps = intEnv('HTTP_RPC_GLOBAL_RPS', 0, atLeast(0));
+  const httpRpcGlobalBurst = intEnv('HTTP_RPC_GLOBAL_BURST', 200, atLeast(1));
+  // Prefix length that defines one IPv6 client for every per-client limit.
+  const clientIpv6PrefixLen = intEnv('CLIENT_IPV6_PREFIX_LEN', CLIENT_IPV6_PREFIX_DEFAULT, atLeast(CLIENT_IPV6_PREFIX_MIN, CLIENT_IPV6_PREFIX_MAX));
   // Concurrency caps: 0 disables. (Parsed here, not with `|| default`, which would
   // turn an explicit 0 back into the default.)
   const connMaxPerIp = intEnv('CONN_MAX_PER_IP', 16, atLeast(0));
@@ -200,6 +214,9 @@ export function loadConfig(): Config {
     tapeResyncMaxEntries,
     httpRpcPerIpRps,
     httpRpcPerIpBurst,
+    httpRpcGlobalRps,
+    httpRpcGlobalBurst,
+    clientIpv6PrefixLen,
     pendingRpcMax,
     rpcAdvertTtlMs,
     connIdleTimeoutMs,

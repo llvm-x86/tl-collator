@@ -122,3 +122,35 @@ test('config: the accepted integer spellings are decimal, optionally signed, sur
     withEnv({ PORT: v }, () => assert.throws(() => loadConfig(), /PORT must be an integer/, `PORT=${v}`));
   }
 });
+
+test('config: CLIENT_IPV6_PREFIX_LEN defaults to /64 and accepts 32..128', () => {
+  withEnv({}, () => assert.equal(loadConfig().clientIpv6PrefixLen, 64));
+  withEnv({ CLIENT_IPV6_PREFIX_LEN: '32' }, () => assert.equal(loadConfig().clientIpv6PrefixLen, 32));
+  withEnv({ CLIENT_IPV6_PREFIX_LEN: '128' }, () => assert.equal(loadConfig().clientIpv6PrefixLen, 128));
+});
+
+test('config: CLIENT_IPV6_PREFIX_LEN outside 32..128 aborts startup', () => {
+  for (const v of ['31', '129', '0', '-64']) {
+    withEnv({ CLIENT_IPV6_PREFIX_LEN: v }, () => {
+      assert.throws(() => loadConfig(), /CLIENT_IPV6_PREFIX_LEN must be an integer from 32 to 128/, v);
+    });
+  }
+});
+
+test('config: a non-integer CLIENT_IPV6_PREFIX_LEN aborts startup', () => {
+  for (const v of ['64.0', '/64', 'sixty-four']) {
+    withEnv({ CLIENT_IPV6_PREFIX_LEN: v }, () => {
+      assert.throws(() => loadConfig(), /CLIENT_IPV6_PREFIX_LEN must be an integer/, v);
+    });
+  }
+});
+
+test('config: the global HTTP budget is off by default and parsed strictly', () => {
+  withEnv({}, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.httpRpcGlobalRps, 0);
+    assert.equal(cfg.httpRpcGlobalBurst, 200);
+  });
+  withEnv({ HTTP_RPC_GLOBAL_RPS: '-1' }, () => assert.throws(() => loadConfig(), /HTTP_RPC_GLOBAL_RPS must be an integer/));
+  withEnv({ HTTP_RPC_GLOBAL_BURST: '0' }, () => assert.throws(() => loadConfig(), /HTTP_RPC_GLOBAL_BURST must be an integer/));
+});

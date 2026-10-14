@@ -49,9 +49,44 @@ export function normalizeIp(raw: string): string {
   return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
 }
 
-/** Admission / rate-limit identity for a client IP. Shared by every requester type. */
-export function clientKeyForIp(ip: string): string {
-  return `ip:${ip || 'unknown'}`;
+// IPv6 limiter-key prefix length (CLIENT_IPV6_PREFIX_LEN). A residential or VPS
+// customer normally holds a whole /64, so keying on the full address would give
+// one customer 2^64 buckets. Bounds: shorter than /32 would merge whole ISP
+// allocations into one budget; longer than /128 is meaningless.
+export const CLIENT_IPV6_PREFIX_MIN = 32;
+export const CLIENT_IPV6_PREFIX_MAX = 128;
+export const CLIENT_IPV6_PREFIX_DEFAULT = 64;
+
+// Expands canonical IPv6 text (as produced by normalizeIp) into eight 16-bit words.
+function ipv6Words(canonical: string): number[] {
+  const halves = canonical.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length > 1 && halves[1] ? halves[1].split(':') : [];
+  const zeros = new Array<string>(8 - head.length - tail.length).fill('0');
+  return [...head, ...zeros, ...tail].map((g) => parseInt(g, 16));
+}
+
+/**
+ * Admission / rate-limit identity for a client IP. Every per-client budget, cap
+ * and per-client aggregation keys on this, never on the raw address:
+ *  - IPv4 → the address;
+ *  - IPv4-mapped IPv6 (`::ffff:a.b.c.d`) → the embedded IPv4, so both spellings are one client;
+ *  - other IPv6 → its `ipv6PrefixLen` prefix (default /64), so one allocation is one client.
+ * The raw resolved IP is still used for logging and for forwarding.
+ */
+export function clientKeyForIp(ip: string, ipv6PrefixLen: number): string {
+  if (!Number.isInteger(ipv6PrefixLen) || ipv6PrefixLen < CLIENT_IPV6_PREFIX_MIN || ipv6PrefixLen > CLIENT_IPV6_PREFIX_MAX) {
+    throw new Error(`CLIENT_IPV6_PREFIX_LEN must be an integer from ${CLIENT_IPV6_PREFIX_MIN} to ${CLIENT_IPV6_PREFIX_MAX}`);
+  }
+  const addr = normalizeIp(ip);
+  if (!addr) return 'ip:unknown';
+  if (net.isIP(addr) === 4) return `ip:${addr}`;
+  const masked = ipv6Words(addr).map((word, i) => {
+    const bits = Math.min(16, Math.max(0, ipv6PrefixLen - 16 * i));
+    const mask = bits === 0 ? 0 : (0xffff << (16 - bits)) & 0xffff;
+    return word & mask;
+  });
+  return `ip:${normalizeIp(masked.map((w) => w.toString(16)).join(':'))}/${ipv6PrefixLen}`;
 }
 
 function parseCidr(entry: string): ParsedCidr {

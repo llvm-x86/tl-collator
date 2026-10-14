@@ -122,6 +122,13 @@ for (const needle of [
   "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed'",
   'for (const key of admissionKeys) rpcAdmission.acquire(key);',
   "const tapeResyncGate = new MinIntervalGate(",
+  // Limiter identity (one key for every per-client budget): IPv6 collapses to its
+  // prefix, and the HTTP table is bounded and never resets a client on eviction.
+  "const clientKey = (ip: string): string => clientKeyForIp(ip, cfg.clientIpv6PrefixLen);",
+  "const ipKey = clientKey(remoteIp);",
+  "const ipKey = clientKey(caller.ip);",
+  "const httpRpcBuckets = new KeyedTokenBuckets({",
+  "event: 'http-bucket-table-full'",
   "const admissionKeys = sessionKey ? [sessionKey, ipKey] : [ipKey];",
   "!HTTP_UNLIMITED_PATHS.has(u.pathname) && !httpRpcAllowed(clientIp)",
   "code: 'RPC_RATE_LIMITED'",
@@ -237,6 +244,8 @@ for (const needle of [
   'TRUST_PROXY_CIDRS',
   'TRUST_PROXY=1 requires TRUST_PROXY_CIDRS',
   'if (!isTrustedHop(peer)) return peer;',
+  'export function clientKeyForIp(ip: string, ipv6PrefixLen: number): string {',
+  'export const CLIENT_IPV6_PREFIX_DEFAULT = 64;',
 ]) {
   if (!clientIpSrc.includes(needle)) throw new Error(`Client IP policy missing: ${needle}`);
 }
@@ -248,6 +257,7 @@ if (/header\(\s*req\s*,\s*'(?:cf-connecting-ip|x-real-ip)'\s*\)/.test(clientIpSr
 // config.ts: admission caps are parsed strictly (startup aborts on garbage).
 for (const needle of [
   "intEnv('CONN_MAX_PER_IP'",
+  "intEnv('CLIENT_IPV6_PREFIX_LEN'",
   "intEnv('PENDING_RPC_MAX_PER_SESSION'",
   "intEnv('PENDING_RPC_MAX'",
   "intEnv('CONN_IDLE_TIMEOUT_MS'",

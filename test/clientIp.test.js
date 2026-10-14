@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createClientIpResolver, normalizeIp, parseTrustedProxyConfig } from '../dist/clientIp.js';
+import { clientKeyForIp, createClientIpResolver, normalizeIp, parseTrustedProxyConfig } from '../dist/clientIp.js';
 
 const req = (remoteAddress, headers = {}) => ({ socket: { remoteAddress }, headers });
 
@@ -105,4 +105,45 @@ test('N3: spoofed X-Real-IP with an appended X-Forwarded-For resolves to the app
   const r = createClientIpResolver({ enabled: true, cidrs: ['127.0.0.1/32'] });
   const attack = req('127.0.0.1', { 'x-forwarded-for': '198.51.100.7', 'x-real-ip': '203.0.113.1' });
   assert.equal(r.resolve(attack), '198.51.100.7');
+});
+
+// Limiter identity. Every per-client budget keys on clientKeyForIp(ip, prefixLen).
+test('client key: two IPv6 addresses in the same /64 are one client', () => {
+  assert.equal(
+    clientKeyForIp('2001:db8:1:2::1', 64),
+    clientKeyForIp('2001:db8:1:2:ffff:ffff:ffff:fffe', 64),
+  );
+  // Same /64, different spellings of the same address still agree.
+  assert.equal(clientKeyForIp('2001:0db8:0001:0002:0000:0000:0000:0001', 64), clientKeyForIp('2001:db8:1:2::1', 64));
+});
+
+test('client key: different /64 prefixes are different clients', () => {
+  assert.notEqual(clientKeyForIp('2001:db8:1:2::1', 64), clientKeyForIp('2001:db8:1:3::1', 64));
+});
+
+test('client key: IPv4-mapped IPv6 is the embedded IPv4 in either spelling', () => {
+  assert.equal(clientKeyForIp('::ffff:203.0.113.5', 64), clientKeyForIp('203.0.113.5', 64));
+  assert.equal(clientKeyForIp('::ffff:cb00:7105', 64), clientKeyForIp('203.0.113.5', 64));
+  assert.equal(clientKeyForIp('203.0.113.5', 64), 'ip:203.0.113.5');
+});
+
+test('client key: IPv4 addresses are never collapsed', () => {
+  assert.notEqual(clientKeyForIp('203.0.113.5', 64), clientKeyForIp('203.0.113.6', 64));
+});
+
+test('client key: the prefix length is the configured one', () => {
+  assert.equal(clientKeyForIp('2001:db8:1:2:aaaa::1', 48), clientKeyForIp('2001:db8:1:ffff::9', 48));
+  assert.equal(clientKeyForIp('2001:db8:1:2:aaaa::1', 64), clientKeyForIp('2001:db8:1:2:bbbb::1', 64));
+  assert.notEqual(clientKeyForIp('2001:db8:1:2::1', 128), clientKeyForIp('2001:db8:1:2::2', 128));
+});
+
+test('client key: an unparseable or empty address keys to one shared unknown bucket', () => {
+  assert.equal(clientKeyForIp('', 64), 'ip:unknown');
+  assert.equal(clientKeyForIp('not-an-ip', 64), 'ip:unknown');
+});
+
+test('client key: prefix length outside 32..128 is refused', () => {
+  for (const bad of [31, 129, 64.5, Number.NaN]) {
+    assert.throws(() => clientKeyForIp('2001:db8::1', bad), /CLIENT_IPV6_PREFIX_LEN/, String(bad));
+  }
 });

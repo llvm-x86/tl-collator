@@ -222,6 +222,32 @@ test('N1: tl_bitvmStatus on /tl_bitvmStatus and /rpc/:method shares the per-reso
   }
 });
 
+test('limiter: IPv6 clients in one /64 share one HTTP budget; another /64 does not', { timeout: 120000 }, async () => {
+  // A customer holding a /64 must not get a fresh bucket per address.
+  const c = await startCollator({
+    TRUST_PROXY: '1',
+    TRUST_PROXY_CIDRS: '127.0.0.1/32',
+    HTTP_RPC_PER_IP_BURST: '2',
+    HTTP_RPC_PER_IP_RPS: '1',
+  });
+  const hit = (ip) => fetch(`${c.base}/tl_bitvmStatus`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': ip },
+    body: '{}',
+  });
+  try {
+    assert.equal((await hit('2001:db8:1:2::1')).status, 200);
+    assert.equal((await hit('2001:db8:1:2:dead:beef::2')).status, 200);
+    assert.equal((await hit('2001:db8:1:2:ffff::3')).status, 429, 'third address in the same /64 is over the shared burst');
+    assert.equal((await hit('2001:db8:1:3::1')).status, 200, 'a different /64 has its own budget');
+    assert.equal((await hit('::ffff:203.0.113.20')).status, 200);
+    assert.equal((await hit('203.0.113.20')).status, 200);
+    assert.equal((await hit('::ffff:203.0.113.20')).status, 429, 'an IPv4-mapped address is the same client as its IPv4 form');
+  } finally {
+    await c.stop();
+  }
+});
+
 test('errors: an oversize body is a fixed 413 with no internal detail', { timeout: 120000 }, async () => {
   const c = await startCollator({ MAX_MSG_BYTES: '64' });
   try {
