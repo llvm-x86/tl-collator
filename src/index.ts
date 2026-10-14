@@ -12,7 +12,9 @@ import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg,
 import { verifyTraderSig, ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
 import { computeEnvelopeHash } from './canonical.js';
 import { TapeStore } from './tape.js';
-import { PeerSession } from './peerSession.js';
+import { PeerSession, broadcastTapeEntry } from './peerSession.js';
+import { fetchBoundedJson } from './boundedFetch.js';
+import { attachRequestDeadlines } from './httpDeadlines.js';
 import { isWireMsg } from './validate.js';
 import { ConcurrencyCounter, KeyedTokenBuckets, MinIntervalGate, TokenBucket } from './ratelimit.js';
 import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
@@ -74,6 +76,10 @@ function normalizeRpcMethod(method: unknown): string {
 const TAPE_SUB_MIN_INTERVAL_MS = 1000;
 // Bound on tracked per-client HTTP buckets (see KeyedTokenBuckets).
 const HTTP_BUCKET_TABLE_MAX = 5000;
+// Round 8: deadline and body cap for calls to the legacy relayer (its routes can answer large
+// balance and UTXO lists, so the cap is larger than the intel and clearlist caps).
+const LEGACY_PROXY_TIMEOUT_MS = 20_000;
+const LEGACY_PROXY_MAX_BYTES = 8 * 1024 * 1024;
 
 function isPublicRpcMethod(method: unknown): boolean {
   return PUBLIC_RPC_METHODS.has(normalizeRpcMethod(method));
@@ -106,20 +112,28 @@ class RequestBodyTooLarge extends Error {}
 
 function readHttpJson(req: http.IncomingMessage, maxBytes: number): Promise<any> {
   return new Promise((resolve, reject) => {
-    let raw = '';
+    // Round 8: the size is a running byte count. Re-measuring the accumulated text on every chunk
+    // was quadratic for a body sent in small pieces.
+    const chunks: Buffer[] = [];
+    let total = 0;
     let tooLarge = false;
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
+    req.on('data', (chunk: Buffer) => {
       // Stop buffering once over the limit; the caller answers 413 and closes.
       if (tooLarge) return;
-      raw += chunk;
-      if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
+      total += chunk.length;
+      if (total > maxBytes) {
         tooLarge = true;
-        raw = '';
+        chunks.length = 0;
         reject(new RequestBodyTooLarge('request body too large'));
+        return;
       }
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(raw ? safeJsonParse(raw) : null));
+    req.on('end', () => {
+      if (tooLarge) return;
+      const raw = Buffer.concat(chunks).toString('utf8');
+      resolve(raw ? safeJsonParse(raw) : null);
+    });
     req.on('error', reject);
   });
 }
@@ -128,16 +142,6 @@ function normalizeCompatParams(body: any): unknown[] {
   if (Array.isArray(body?.params)) return body.params;
   if (body?.params == null) return [];
   return [body.params];
-}
-
-async function readResponseBody(res: Response): Promise<any> {
-  const text = await res.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
 }
 
 function writeJson(res: http.ServerResponse, statusCode: number, body: unknown): void {
@@ -261,8 +265,12 @@ async function main() {
     ? https.createServer({
         key: fs.readFileSync(cfg.tlsKeyPath),
         cert: fs.readFileSync(cfg.tlsCertPath),
+        // Round 8: TLS handshake deadline (see httpDeadlines.ts); the Node default is 120 s.
+        handshakeTimeout: 10_000,
       })
     : http.createServer();
+  // Round 8: header, body and idle deadlines for every connection (slowloris). See httpDeadlines.ts.
+  attachRequestDeadlines(server);
 
   const wss = new WebSocketServer({ server, path: cfg.wsPath, maxPayload: cfg.maxMsgBytes });
   const sessions = new Map<string, PeerSession>();
@@ -534,12 +542,17 @@ async function main() {
         if (v != null) url.searchParams.set(k, v);
       }
     }
-    const res = await fetch(url, {
-      method,
-      headers: { 'content-type': 'application/json', ...(headers || {}) },
-      body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body ?? {}),
-    });
-    return { statusCode: res.status, body: await readResponseBody(res) };
+    // Round 8: the legacy relayer answer has a deadline and a body cap, and redirects are refused.
+    const res = await fetchBoundedJson(
+      url,
+      {
+        method,
+        headers: { 'content-type': 'application/json', ...(headers || {}) },
+        body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body ?? {}),
+      },
+      { timeoutMs: LEGACY_PROXY_TIMEOUT_MS, maxBytes: LEGACY_PROXY_MAX_BYTES },
+    );
+    return { statusCode: res.status, body: res.body };
   };
 
   const routeCompatRpcRequest = async (
@@ -1290,7 +1303,8 @@ async function main() {
 
           pc.ondatachannel = (ev: any) => {
             const dc: RTCDataChannel = ev.channel;
-            sess.dc = dc;
+            // Round 8: one live channel per session; the one it replaces is closed.
+            sess.attachDataChannel(dc);
 
             dc.onmessage = async (ev2: any) => {
               try {
@@ -1554,11 +1568,8 @@ async function main() {
                   });
 
                   // Broadcast to all tape subscribers (MVP: if no explicit subscribers, still broadcast).
-                  for (const p of peers) {
-                    if (!p.dc || p.dc.readyState !== 'open') continue;
-                    if (!p.wantsTape) continue;
-                    p.sendTapeEntry(entry);
-                  }
+                  // The entry is committed at this point; the broadcast can not turn it into an error.
+                  broadcastTapeEntry(peers, entry);
                   return;
                 }
               } catch (e: any) {
@@ -1573,7 +1584,9 @@ async function main() {
               // No-op. Wait for client HELLO/TAPE_SUB.
             };
             dc.onclose = () => {
-              sess.dc = null;
+              // Only the channel the session currently holds. A replaced channel closes after
+              // its successor is attached, and must not detach the successor.
+              if (sess.dc === dc) sess.dc = null;
             };
           };
 
@@ -1621,6 +1634,23 @@ async function main() {
     );
   });
 }
+
+// Round 8: process-level error policy, the same as the relayer (round 7). Request and session
+// failures are answered at their own boundary. An unhandled rejection is logged and the collator
+// keeps serving, because a single missed catch must not be a remote crash. An uncaught exception
+// exits, because synchronous state may be inconsistent and the supervisor restarts the process.
+// Only the message is logged: errors can carry request config and provider URLs.
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error(JSON.stringify({
+    service: 'tl-collator',
+    event: 'unhandled-rejection',
+    msg: reason instanceof Error ? reason.message : String(reason),
+  }));
+});
+process.on('uncaughtException', (error: Error) => {
+  console.error(JSON.stringify({ service: 'tl-collator', event: 'uncaught-exception', msg: error?.message || 'unknown error' }));
+  process.exit(1);
+});
 
 main().catch((e) => {
   // eslint-disable-next-line no-console

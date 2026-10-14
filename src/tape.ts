@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { stableStringify } from './canonical.js';
 import { sha256Hex, signWithPrivKeyHex } from './crypto.js';
 import { buildIndex, findStartOffset, isIndexFresh, loadIndex, saveIndex, type TapeIndex } from './tapeIndex.js';
@@ -218,12 +219,16 @@ export class TapeStore {
       let carry = '';
       let sent = 0;
       let lastSentSeq = 0;
+      // Round 8: a multi-byte UTF-8 character can straddle two reads. Decoding each read on its
+      // own turned the split character into U+FFFD inside a valid-looking entry, which replay then
+      // sent to wallets. A StringDecoder keeps the partial bytes until the next read completes them.
+      const decoder = new StringDecoder('utf8');
 
       while (filePos < st.size) {
         const n = fs.readSync(fd, buf, 0, buf.length, filePos);
         if (n <= 0) break;
         filePos += n;
-        const chunk = carry + buf.slice(0, n).toString('utf8');
+        const chunk = carry + decoder.write(buf.subarray(0, n));
         const parts = chunk.split(/\r?\n/);
         carry = parts.pop() || '';
         for (const line of parts) {

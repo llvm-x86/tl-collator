@@ -275,3 +275,19 @@ Example:
   {"urls":["turn:turn.example.com:3478"],"username":"u","credential":"p"}
 ]
 ```
+
+## Fixed limits (not env-configurable)
+
+These bounds are enforced in code. A request or session that exceeds one is refused at its own boundary.
+
+| Limit | Value | Where |
+| --- | --- | --- |
+| HTTP request headers | 10 s from connection start (and from the end of each response) | `src/httpDeadlines.ts` |
+| HTTP request body | 30 s from headers complete until the body ends | `src/httpDeadlines.ts` |
+| Idle keep-alive socket | 60 s after a response finishes | `src/httpDeadlines.ts` |
+| TLS handshake | 10 s (HTTPS mode only) | `src/index.ts` (`handshakeTimeout`) |
+| DataChannel unsent data | 4 MiB; past it the channel is closed | `src/peerSession.ts` (`DC_MAX_BUFFERED_BYTES`) |
+| IP intel and clearlist answer | 3 s deadline, 64 KiB body, redirects refused | `src/boundedFetch.ts` callers |
+| Legacy relayer answer | 20 s deadline, 8 MiB body, redirects refused | `src/index.ts` (`LEGACY_PROXY_*`) |
+
+The WebSocket frame and DataChannel message size is `MAX_MSG_BYTES` (default 1 MiB). The connection cap is `CONN_MAX` and `CONN_MAX_PER_IP`. Those are unchanged in round 8.

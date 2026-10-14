@@ -1,4 +1,9 @@
 import { LruMap } from './lru.js';
+import { fetchBoundedJson } from './boundedFetch.js';
+
+// Round 8: a stalled or oversized IP intel answer must not hold a SUBMIT open or buffer without limit.
+const IP_INTEL_TIMEOUT_MS = 3000;
+const IP_INTEL_MAX_BYTES = 64 * 1024;
 
 export interface IpIntel {
   asn?: number;
@@ -21,13 +26,17 @@ export class IpIntelClient {
     const hit = this.cache.get(ip);
     if (hit && hit.exp > now) return hit.v;
 
-    const res = await fetch(this.url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ip }),
-    });
+    const res = await fetchBoundedJson(
+      this.url,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ip }),
+      },
+      { timeoutMs: IP_INTEL_TIMEOUT_MS, maxBytes: IP_INTEL_MAX_BYTES },
+    );
     if (!res.ok) throw new Error(`ipIntel http ${res.status}`);
-    const j: any = await res.json();
+    const j: any = res.body;
     const v: IpIntel = {
       asn: Number.isFinite(Number(j?.asn)) ? Number(j.asn) : undefined,
       vpn: typeof j?.vpn === 'boolean' ? j.vpn : undefined,
