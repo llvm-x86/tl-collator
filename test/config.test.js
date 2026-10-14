@@ -36,3 +36,36 @@ test('config: an explicit 0 disables a cap and empty means the default', () => {
     assert.equal(cfg.pendingRpcMaxPerSession, 32);
   });
 });
+
+test('config: every integer env var is parsed strictly, including the ones read with `Number(x) || default`', () => {
+  for (const [k, v] of [
+    ['PENDING_RPC_MAX', 'ten'],
+    ['TL_COLLATOR_RPC_ADVERT_TTL_MS', '45s'],
+    ['CONN_IDLE_TIMEOUT_MS', '6e4'],
+    ['CONN_SWEEP_INTERVAL_MS', 'x'],
+    ['CONN_HANDSHAKE_GRACE_MS', '5000ms'],
+    ['BITVM_COLLATERAL_PROPERTY_ID', 'one'],
+    ['ASN_BLOCKLIST', '64496,AS65000'],
+  ]) {
+    withEnv({ [k]: v }, () => {
+      assert.throws(() => loadConfig(), new RegExp(`${k} must be an integer`), `${k}=${v} must abort`);
+    });
+  }
+});
+
+test('config: unset, empty and explicit values for the converted integer env vars', () => {
+  withEnv({ PENDING_RPC_MAX: '', CONN_IDLE_TIMEOUT_MS: '', ASN_BLOCKLIST: ' 64496 , ,65000 ' }, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.pendingRpcMax, 1000);
+    assert.equal(cfg.connIdleTimeoutMs, 60000);
+    assert.equal(cfg.connSweepIntervalMs, 15000);
+    assert.equal(cfg.rpcAdvertTtlMs, 45000);
+    assert.deepEqual(cfg.asnBlocklist, [64496, 65000]);
+  });
+  withEnv({ PENDING_RPC_MAX: '0', CONN_HANDSHAKE_GRACE_MS: '0', TL_COLLATOR_RPC_ADVERT_TTL_MS: '1' }, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.pendingRpcMax, 1, 'a zero or tiny value is clamped to the floor, not replaced by the default');
+    assert.equal(cfg.connHandshakeGraceMs, 0);
+    assert.equal(cfg.rpcAdvertTtlMs, 15000);
+  });
+});

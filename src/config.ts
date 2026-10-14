@@ -34,6 +34,11 @@ export interface Config {
   tapeResyncMaxEntries: number;
   httpRpcPerIpRps: number;
   httpRpcPerIpBurst: number;
+  pendingRpcMax: number;
+  rpcAdvertTtlMs: number;
+  connIdleTimeoutMs: number;
+  connSweepIntervalMs: number;
+  connHandshakeGraceMs: number;
   connMaxPerIp: number;
   pendingRpcMaxPerSession: number;
   pendingRpcMaxPerIp: number;
@@ -42,16 +47,21 @@ export interface Config {
   iceServers: RTCIceServer[];
 }
 
-// Unset or empty means the default. Anything else must be a safe integer: a
-// typo such as CONN_MAX=25six aborts startup instead of silently running with
-// the default.
-function intEnv(k: string, d: number): number {
-  const v = (process.env[k] ?? '').trim();
+// The single integer-env parser for the collator. Unset or empty means the
+// default. Anything else must be a safe integer: a typo such as CONN_MAX=25six
+// aborts startup instead of silently running with the default. Every integer
+// env var goes through here (no `Number(x) || default` sites).
+export function parseIntEnv(k: string, raw: string | undefined, d: number): number {
+  const v = (raw ?? '').trim();
   if (v === '') return d;
   if (!/^[+-]?\d+$/.test(v) || !Number.isSafeInteger(Number(v))) {
-    throw new Error(`${k} must be an integer (got "${process.env[k]}")`);
+    throw new Error(`${k} must be an integer (got "${raw}")`);
   }
   return Number(v);
+}
+
+export function intEnv(k: string, d: number): number {
+  return parseIntEnv(k, process.env[k], d);
 }
 
 export function loadConfig(): Config {
@@ -99,10 +109,13 @@ export function loadConfig(): Config {
     ? (rawAsnMode === 'reject' ? 'reject' : rawAsnMode === 'log' ? 'log' : 'off')
     : 'off') as 'off' | 'log' | 'reject';
 
+  // Comma-separated ASNs; empty entries are skipped, anything else must be a positive integer.
   const asnBlocklist = String(process.env.ASN_BLOCKLIST || '')
     .split(',')
-    .map((s) => parseInt(s.trim(), 10))
-    .filter((n) => Number.isFinite(n) && n > 0);
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+    .map((s) => parseIntEnv('ASN_BLOCKLIST', s, 0))
+    .filter((n) => n > 0);
 
   // Support both new and old env var names.
   const submitBurst = intEnv('SUBMIT_BURST', 10);
@@ -123,6 +136,14 @@ export function loadConfig(): Config {
   // Concurrency caps: 0 disables. (Parsed here, not with `|| default`, which would
   // turn an explicit 0 back into the default.)
   const connMaxPerIp = Math.max(0, intEnv('CONN_MAX_PER_IP', 16));
+  // Hard cap on concurrent in-flight routed RPC requests.
+  const pendingRpcMax = Math.max(1, intEnv('PENDING_RPC_MAX', 1000));
+  const rpcAdvertTtlMs = Math.max(15000, intEnv('TL_COLLATOR_RPC_ADVERT_TTL_MS', 45000));
+  const connIdleTimeoutMs = Math.max(1, intEnv('CONN_IDLE_TIMEOUT_MS', 60000));
+  const connSweepIntervalMs = Math.max(1000, intEnv('CONN_SWEEP_INTERVAL_MS', 15000));
+  const connHandshakeGraceMs = Math.max(0, intEnv('CONN_HANDSHAKE_GRACE_MS', 5000));
+  // Read again per status build (bitvmStatus.ts); validated here so a typo aborts startup, not every request.
+  intEnv('BITVM_COLLATERAL_PROPERTY_ID', 1);
   const pendingRpcMaxPerSession = Math.max(0, intEnv('PENDING_RPC_MAX_PER_SESSION', 32));
   const pendingRpcMaxPerIp = Math.max(0, intEnv('PENDING_RPC_MAX_PER_IP', 256));
 
@@ -157,6 +178,11 @@ export function loadConfig(): Config {
     tapeResyncMaxEntries,
     httpRpcPerIpRps,
     httpRpcPerIpBurst,
+    pendingRpcMax,
+    rpcAdvertTtlMs,
+    connIdleTimeoutMs,
+    connSweepIntervalMs,
+    connHandshakeGraceMs,
     connMaxPerIp,
     pendingRpcMaxPerSession,
     pendingRpcMaxPerIp,

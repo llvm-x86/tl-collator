@@ -192,6 +192,53 @@ test('N1: the per-IP HTTP limit covers every HTTP route that reaches the mesh, n
   }
 });
 
+test('N1: tl_bitvmStatus on /tl_bitvmStatus and /rpc/:method shares the per-resolved-IP HTTP budget', { timeout: 120000 }, async () => {
+  // Behind a trusted hop: each real client (X-Forwarded-For) has its own bucket.
+  const c = await startCollator({
+    TRUST_PROXY: '1',
+    TRUST_PROXY_CIDRS: '127.0.0.1/32',
+    HTTP_RPC_PER_IP_BURST: '2',
+    HTTP_RPC_PER_IP_RPS: '1',
+  });
+  const hit = (path, ip) => fetch(`${c.base}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': ip },
+    body: '{}',
+  });
+  try {
+    // Client A spends its whole burst across both bitvm entry points.
+    assert.equal((await hit('/tl_bitvmStatus', '203.0.113.10')).status, 200);
+    assert.equal((await hit('/rpc/tl_bitvmStatus', '203.0.113.10')).status, 200);
+    const limited = await hit('/rpc/tl_bitvmStatus', '203.0.113.10');
+    assert.equal(limited.status, 429, 'bitvm status past the burst is refused on /rpc/:method');
+    assert.equal((await limited.json()).code, 'RPC_RATE_LIMITED');
+    const limitedLegacyPath = await hit('/tl_bitvmStatus', '203.0.113.10');
+    assert.equal(limitedLegacyPath.status, 429, 'bitvm status past the burst is refused on /tl_bitvmStatus');
+    // Client B, behind the same proxy socket, is unaffected.
+    assert.equal((await hit('/tl_bitvmStatus', '203.0.113.11')).status, 200);
+    assert.equal((await hit('/rpc/tl_bitvmStatus', '203.0.113.11')).status, 200);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('errors: an oversize body is a fixed 413 with no internal detail', { timeout: 120000 }, async () => {
+  const c = await startCollator({ MAX_MSG_BYTES: '64' });
+  try {
+    const big = await fetch(`${c.base}/rpc/route`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ service: 'tradelayer.rpc', method: 'tl_getsyncstatus', params: ['x'.repeat(200)] }),
+    });
+    const text = await big.text();
+    assert.equal(big.status, 413);
+    assert.match(text, /request body too large/);
+    assert.doesNotMatch(text, /stack|at .*\.js|Error:/);
+  } finally {
+    await c.stop();
+  }
+});
+
 test('N4: WebSocket connection cap is keyed on the resolved client IP, not the proxy socket', { timeout: 120000 }, async () => {
   // Without a trusted hop every socket is 127.0.0.1, so a second client is refused.
   const direct = await startCollator({ CONN_MAX_PER_IP: '1' });

@@ -61,6 +61,12 @@ const PUBLIC_RPC_METHODS = new Set([
   'decoderawtransaction',
 ]);
 
+// Internal error detail goes to the log only. Peer-facing responses carry fixed text.
+function logInternalError(event: string, e: unknown): void {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(JSON.stringify({ service: 'tl-collator', event, msg }));
+}
+
 function normalizeRpcMethod(method: unknown): string {
   return String(method || '').trim().toLowerCase();
 }
@@ -95,15 +101,21 @@ function safeJsonParse(s: string): any | null {
   }
 }
 
+class RequestBodyTooLarge extends Error {}
+
 function readHttpJson(req: http.IncomingMessage, maxBytes: number): Promise<any> {
   return new Promise((resolve, reject) => {
     let raw = '';
+    let tooLarge = false;
     req.setEncoding('utf8');
     req.on('data', (chunk) => {
+      // Stop buffering once over the limit; the caller answers 413 and closes.
+      if (tooLarge) return;
       raw += chunk;
       if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
-        reject(new Error('request body too large'));
-        req.destroy();
+        tooLarge = true;
+        raw = '';
+        reject(new RequestBodyTooLarge('request body too large'));
       }
     });
     req.on('end', () => resolve(raw ? safeJsonParse(raw) : null));
@@ -197,7 +209,7 @@ async function main() {
   const startedAt = Date.now();
   const compatRpcService = process.env.TL_COLLATOR_RPC_SERVICE || 'tradelayer.rpc';
   const compatRpcNetwork = process.env.TL_COLLATOR_RPC_NETWORK || '';
-  const rpcAdvertTtlMs = Math.max(15000, Number(process.env.TL_COLLATOR_RPC_ADVERT_TTL_MS || 45000) || 45000);
+  const rpcAdvertTtlMs = cfg.rpcAdvertTtlMs;
   const corsOrigins = configuredCorsOrigins();
   const isProduction = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
   const legacyTlProxyEnabled = !isProduction && String(process.env.TL_COLLATOR_ENABLE_LEGACY_TL_PROXY || '').trim() === '1';
@@ -210,7 +222,7 @@ async function main() {
   // TRUST_PROXY_CIDRS hops (validated at startup in config.ts).
   const clientIpResolver = createClientIpResolver(cfg.trustedProxy);
   // Hard cap on concurrent in-flight routed RPC requests (C2d/H3).
-  const pendingRpcMax = Math.max(1, Number(process.env.PENDING_RPC_MAX || '') || 1000);
+  const pendingRpcMax = cfg.pendingRpcMax;
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
     process.env.TL_WALLET_LISTENER_URL ||
@@ -330,7 +342,16 @@ async function main() {
     return null;
   };
 
-  // Per-client-IP token bucket for HTTP-routed RPCs (HTTP_RPC_PER_IP_RPS / _BURST).
+  // Local status routes that never reach upstream and are not charged.
+  const HTTP_UNLIMITED_PATHS = new Set(['/health', '/manifest', '/rpc/providers']);
+  const httpRateLimitedBody = (pathname: string): unknown => {
+    const message = 'too many RPC requests from this client; retry later';
+    return pathname === '/rpc/route'
+      ? { ok: false, error: { code: 'RPC_RATE_LIMITED', message } }
+      : { error: message, code: 'RPC_RATE_LIMITED' };
+  };
+  // Per-client-IP token bucket for HTTP requests (HTTP_RPC_PER_IP_RPS / _BURST).
+  // Called only from the HTTP entry gate, once per request.
   const httpRpcAllowed = (ip: string): boolean => {
     const key = clientKeyForIp(ip);
     let bucket = httpRpcBuckets.get(key);
@@ -341,10 +362,10 @@ async function main() {
     return bucket.allow(1);
   };
 
-  // Single enforcement point for routed RPCs. `caller.session` is set only for
-  // WebSocket callers, who receive RPC_RES over their DataChannel; every other
-  // caller is HTTP and is rate-limited per client IP here, so no HTTP route can
-  // reach the mesh without passing the limit.
+  // Routed-RPC admission for one request. `caller.session` is set only for
+  // WebSocket callers, who receive RPC_RES over their DataChannel. HTTP callers
+  // are rate-limited per client IP by httpRpcAllowed at the HTTP entry point,
+  // before this function is reached; this function only applies the concurrency caps.
   const routeRpcRequest = (rpcReq: RpcRequestV1, caller: { ip: string; session?: PeerSession }): Promise<RpcResponseV1> => {
     const requester = caller.session;
     const fail = (code: string, message: string): Promise<RpcResponseV1> => {
@@ -365,9 +386,6 @@ async function main() {
     }
     if (!isPublicRpcMethod(rpcReq.method)) {
       return fail('RPC_METHOD_FORBIDDEN', 'RPC method is not available on the public mesh');
-    }
-    if (!requester && !httpRpcAllowed(caller.ip)) {
-      return fail('RPC_RATE_LIMITED', 'too many RPC requests from this client; retry later');
     }
     const provider = findRpcProvider(rpcReq, requester);
     if (!provider) {
@@ -530,10 +548,11 @@ async function main() {
         const proxied = await proxyLegacyJson('POST', `/rpc/${method}`, { params });
         return proxied;
       } catch (e: any) {
+        logInternalError('legacy-proxy-error', e);
         return {
           statusCode: 502,
           body: {
-            error: e?.message || `legacy relayer proxy failed on ${replyPath}`,
+            error: `legacy relayer proxy failed on ${replyPath}`,
             code: 'LEGACY_PROXY_ERROR',
           },
         };
@@ -596,6 +615,14 @@ async function main() {
         return;
       }
 
+      // Single HTTP admission point. Every route except the local status ones
+      // is charged here, once per request, before the body is read and before
+      // any upstream (mesh or legacy relayer) is contacted.
+      if (!HTTP_UNLIMITED_PATHS.has(u.pathname) && !httpRpcAllowed(clientIp)) {
+        writeJson(res, 429, httpRateLimitedBody(u.pathname));
+        return;
+      }
+
       if (req.method === 'GET' && u.pathname === '/health') {
         pruneRpcAdvertisements();
         writeJson(res, 200, {
@@ -654,12 +681,13 @@ async function main() {
           });
           return;
         } catch (e: any) {
+          logInternalError('ip-intel-error', e);
           writeJson(res, 200, {
             success: false,
             ip,
             isBlocked: false,
             source: 'unknown',
-            message: e?.message || 'No IP reputation provider succeeded',
+            message: 'No IP reputation provider succeeded',
             error: 'Both primary and fallback IP reputation APIs failed or are not configured.',
           });
           return;
@@ -685,10 +713,6 @@ async function main() {
 
       if (u.pathname.startsWith('/tl_')) {
         if (req.method === 'POST' && u.pathname === '/tl_bitvmStatus') {
-          if (!httpRpcAllowed(clientIp)) {
-            writeJson(res, 429, { error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
-            return;
-          }
           const body = await readHttpJson(req, cfg.maxMsgBytes);
           writeJson(res, 200, buildBitvmStatusFromArtifacts(body || {}));
           return;
@@ -717,12 +741,6 @@ async function main() {
         }
         if (!isPublicRpcMethod(method)) {
           writeJson(res, 403, { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
-          return;
-        }
-        // The bitvm status builder does not go through routeRpcRequest, so it
-        // takes the per-IP gate here; routed methods are gated inside it.
-        if (method.toLowerCase() === 'tl_bitvmstatus' && !httpRpcAllowed(clientIp)) {
-          writeJson(res, 429, { error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
           return;
         }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
@@ -1057,7 +1075,12 @@ async function main() {
       res.end('not found');
     })().catch((e: any) => {
       // Details go to the log only; the response must not expose internal errors.
-      console.error(JSON.stringify({ service: 'tl-collator', event: 'http-internal-error', msg: e?.message || String(e) }));
+      if (e instanceof RequestBodyTooLarge) {
+        res.setHeader('Connection', 'close');
+        writeJson(res, 413, { ok: false, error: { code: 'BODY_TOO_LARGE', message: 'request body too large' } });
+        return;
+      }
+      logInternalError('http-internal-error', e);
       writeJson(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'internal error' } });
     });
   });
@@ -1072,9 +1095,7 @@ async function main() {
   //  - handshake reserve: when the pool is full, a fresh handshake displaces
   //    the oldest silent (unestablished) session; only a pool of fully
   //    established DataChannel sessions refuses new connections with 1013.
-  const connIdleTimeoutMs = Math.max(1, Number(process.env.CONN_IDLE_TIMEOUT_MS || '') || 60000);
-  const connSweepIntervalMs = Math.max(1000, Number(process.env.CONN_SWEEP_INTERVAL_MS || '') || 15000);
-  const connHandshakeGraceMs = Math.max(0, Number(process.env.CONN_HANDSHAKE_GRACE_MS || '') || 5000);
+  const { connIdleTimeoutMs, connSweepIntervalMs, connHandshakeGraceMs } = cfg;
   const perIpCounts = new Map<string, number>();
 
   const isSilentPeer = (p: PeerSession): boolean => !p.dc || p.dc.readyState !== 'open';
@@ -1321,13 +1342,14 @@ async function main() {
                     ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
                   });
                   void routeRpcRequest(rpcReq, { ip: remoteIp, session: sess }).catch((e: any) => {
+                    logInternalError('rpc-route-error', e);
                     sess.sendDc({
                       t: 'RPC_RES',
                       v: 1,
                       res: {
                         id: rpcReq.id,
                         ok: false,
-                        error: { code: 'RPC_ROUTE_ERROR', message: e?.message || String(e) },
+                        error: { code: 'RPC_ROUTE_ERROR', message: 'internal error' },
                       },
                     });
                   });
@@ -1472,7 +1494,8 @@ async function main() {
                           }
                         } catch (e: any) {
                           if (cfg.clearlistFailMode === 'closed') {
-                            sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: e?.message || String(e) });
+                            logInternalError('clearlist-down', e);
+                            sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: 'clearlist unavailable' });
                             return;
                           }
                         }
@@ -1510,7 +1533,7 @@ async function main() {
               } catch (e: any) {
                 // A throw here (e.g. the tape refusing a write) must not become an
                 // unhandled rejection, which would take the whole collator down.
-                console.error(JSON.stringify({ service: 'tl-collator', event: 'dc-internal-error', msg: e?.message || String(e) }));
+                logInternalError('dc-internal-error', e);
                 try { sess.sendDc({ t: 'ERR', v: 1, code: 'INTERNAL', msg: 'internal error' }); } catch {}
               }
             };
@@ -1538,7 +1561,8 @@ async function main() {
           return;
         }
       } catch (e: any) {
-        sendSignal({ t: 'SIGNAL_ERR', v: 1, code: 'internal', msg: e?.message || String(e) });
+        logInternalError('signal-error', e);
+        sendSignal({ t: 'SIGNAL_ERR', v: 1, code: 'internal', msg: 'internal error' });
       }
     });
   });
