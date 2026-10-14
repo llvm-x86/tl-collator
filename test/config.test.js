@@ -62,10 +62,63 @@ test('config: unset, empty and explicit values for the converted integer env var
     assert.equal(cfg.rpcAdvertTtlMs, 45000);
     assert.deepEqual(cfg.asnBlocklist, [64496, 65000]);
   });
-  withEnv({ PENDING_RPC_MAX: '0', CONN_HANDSHAKE_GRACE_MS: '0', TL_COLLATOR_RPC_ADVERT_TTL_MS: '1' }, () => {
+  withEnv({ PENDING_RPC_MAX: '1', CONN_HANDSHAKE_GRACE_MS: '0', TL_COLLATOR_RPC_ADVERT_TTL_MS: '15000' }, () => {
     const cfg = loadConfig();
-    assert.equal(cfg.pendingRpcMax, 1, 'a zero or tiny value is clamped to the floor, not replaced by the default');
+    assert.equal(cfg.pendingRpcMax, 1);
     assert.equal(cfg.connHandshakeGraceMs, 0);
     assert.equal(cfg.rpcAdvertTtlMs, 15000);
   });
+});
+
+// Out-of-range values used to be silently clamped or dropped: CONN_MAX=-1 meant
+// no cap, CONN_MAX_PER_IP=-1 meant no cap, ASN_BLOCKLIST=0 dropped the entry, and
+// MAX_MSG_BYTES=0 disabled the WebSocket payload check. Each must abort now.
+test('config: a value outside its bounds aborts startup instead of being clamped, dropped or disabling a check', () => {
+  for (const [k, v] of [
+    ['CONN_MAX', '-1'],
+    ['CONN_MAX_PER_IP', '-1'],
+    ['PENDING_RPC_MAX_PER_SESSION', '-3'],
+    ['PENDING_RPC_MAX_PER_IP', '-1'],
+    ['PENDING_RPC_MAX', '0'],
+    ['SUBMIT_BURST', '0'],
+    ['SUBMIT_RPS', '-1'],
+    ['HTTP_RPC_PER_IP_RPS', '0'],
+    ['HTTP_RPC_PER_IP_BURST', '-4'],
+    ['TAPE_RESYNC_MAX_ENTRIES', '0'],
+    ['TAPE_INDEX_STRIDE', '0'],
+    ['TAPE_REPLAY_BATCH', '0'],
+    ['MAX_MSG_BYTES', '0'],
+    ['MAX_MSG_BYTES', '-1'],
+    ['MAX_MSG_BYTES', '3000000000'],
+    ['CONN_IDLE_TIMEOUT_MS', '0'],
+    ['CONN_SWEEP_INTERVAL_MS', '1'],
+    ['CONN_SWEEP_INTERVAL_MS', '3000000000'],
+    ['CONN_HANDSHAKE_GRACE_MS', '-1'],
+    ['TL_COLLATOR_RPC_ADVERT_TTL_MS', '1'],
+    ['IP_INTEL_TTL_SEC', '-5'],
+    ['BITVM_COLLATERAL_PROPERTY_ID', '-1'],
+    ['BITVM_COLLATERAL_PROPERTY_ID', '0'],
+    ['PORT', '0'],
+    ['PORT', '70000'],
+    ['PORT', '-1'],
+    ['SERVER_PORT', '65536'],
+    ['ASN_BLOCKLIST', '0'],
+    ['ASN_BLOCKLIST', '64496,0'],
+    ['ASN_BLOCKLIST', '-5'],
+    ['ASN_BLOCKLIST', '4294967296'],
+  ]) {
+    withEnv({ [k]: v }, () => {
+      assert.throws(() => loadConfig(), new RegExp(`${k} must be an integer`), `${k}=${v} must abort`);
+    });
+  }
+});
+
+test('config: the accepted integer spellings are decimal, optionally signed, surrounding whitespace only', () => {
+  withEnv({ PORT: '+8800' }, () => assert.equal(loadConfig().port, 8800));
+  withEnv({ PORT: ' 8800 ' }, () => assert.equal(loadConfig().port, 8800));
+  withEnv({ PORT: '   ' }, () => assert.equal(loadConfig().port, 8787));
+  withEnv({ MAX_MSG_BYTES: '2147483647' }, () => assert.equal(loadConfig().maxMsgBytes, 2147483647));
+  for (const v of ['0x10', '1e3', '1_000', '12 34', '٣', '9007199254740993']) {
+    withEnv({ PORT: v }, () => assert.throws(() => loadConfig(), /PORT must be an integer/, `PORT=${v}`));
+  }
 });

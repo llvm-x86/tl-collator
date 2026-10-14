@@ -275,6 +275,10 @@ async function main() {
   const sessionAdmissionKey = (sessionId: string): string => `sess:${sessionId}`;
   // Per-client-IP token buckets for HTTP-routed RPCs; see routeRpcRequest.
   const httpRpcBuckets = new LruMap<TokenBucket>(5000);
+  // Logs (at most once per 10 minutes) when a peer that is not a configured proxy hop
+  // sends forwarding headers: the usual sign of a proxy missing from TRUST_PROXY_CIDRS,
+  // which makes every client share that proxy's HTTP bucket.
+  const forwardedHeaderHintGate = new MinIntervalGate(10 * 60 * 1000, 1);
   // One TAPE_SUB replay per client IP per second; sessions are cheap, so a
   // per-session limit alone would let one IP multiply its replay rate.
   const tapeResyncGate = new MinIntervalGate(TAPE_SUB_MIN_INTERVAL_MS, 5000);
@@ -593,6 +597,15 @@ async function main() {
       // Resolve the client IP once through the trust-gated resolver; per-IP
       // rate limits and routed-RPC admission are keyed on it.
       const clientIp = clientIpResolver.resolve(req);
+      if ((req.headers['x-forwarded-for'] !== undefined || req.headers.forwarded !== undefined)
+        && !clientIpResolver.headersTrusted(req)
+        && forwardedHeaderHintGate.allow('hint')) {
+        console.warn(JSON.stringify({
+          service: 'tl-collator',
+          event: 'untrusted-forwarding-header',
+          msg: 'forwarding headers from a peer outside TRUST_PROXY_CIDRS were ignored; behind a reverse proxy set TRUST_PROXY=1 and TRUST_PROXY_CIDRS',
+        }));
+      }
 
       const requestOrigin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
       const originAllowed = !!requestOrigin && corsOrigins.includes(requestOrigin);

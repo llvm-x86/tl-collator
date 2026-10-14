@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { intEnv } from './config.js';
+import { atLeast, intEnv } from './config.js';
 
 type AnyObj = Record<string, any>;
 
@@ -241,7 +241,7 @@ export function buildBitvmStatusFromArtifacts(query: BitvmStatusQuery = {}): Any
     state: str(proceduralSync.state),
     receiptPropertyId: receiptPropertyId || undefined,
     receiptTicker: chainTicker ? `r${chainTicker}-SAT` : null,
-    collateralPropertyId: intEnv('BITVM_COLLATERAL_PROPERTY_ID', 1),
+    collateralPropertyId: intEnv('BITVM_COLLATERAL_PROPERTY_ID', 1, atLeast(1)),
     adminAddress: operatorAddress,
     vaultAddress: fundingAddress,
     fundingAddress,

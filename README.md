@@ -99,6 +99,9 @@ prototypes.
 
 Environment variables:
 
+Integer variables must be plain decimal integers (optional sign and surrounding whitespace only; no `0x`, exponents, separators or units) inside their documented range. Anything else, including a negative cap or a zero where a value of at least 1 is required, aborts startup instead of being clamped, dropped or silently disabling a check.
+
+
 - `PORT` (default: `8787`, `SERVER_PORT` is accepted as a legacy alias)
 - `WS_PATH` (default: `/ws`)
 - `DATA_DIR` (default: `./data`)

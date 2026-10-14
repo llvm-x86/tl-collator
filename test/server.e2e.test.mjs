@@ -239,6 +239,81 @@ test('errors: an oversize body is a fixed 413 with no internal detail', { timeou
   }
 });
 
+test('gate: every routed or upstream route is charged exactly once per request, 404s included; only the three local paths are free', { timeout: 120000 }, async () => {
+  const c = await startCollator({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '127.0.0.1/32', HTTP_RPC_PER_IP_BURST: '2', HTTP_RPC_PER_IP_RPS: '1' });
+  let n = 0;
+  const send = (method, p, ip) => fetch(`${c.base}${p}`, {
+    method,
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': ip },
+    body: method === 'POST' ? '{}' : undefined,
+  });
+  try {
+    // Burst is 2: a single charge allows two requests and refuses the third.
+    // A double charge would refuse the second.
+    for (const [method, p] of [
+      ['GET', '/chain/info'],
+      ['GET', '/%68ealth'],
+      ['GET', '/health/'],
+      ['GET', '//health'],
+      ['GET', '/rpc/providers/'],
+      ['POST', '/unknown'],
+      ['HEAD', '/rpc/route'],
+      ['POST', '/rpc/route/'],
+      ['POST', '/RPC/ROUTE'],
+      ['POST', '/rpc/tl_getsyncstatus'],
+      ['POST', '/tl_bitvmStatus'],
+    ]) {
+      const ip = `203.0.113.${++n}`;
+      const codes = [];
+      for (let i = 0; i < 3; i++) codes.push((await send(method, p, ip)).status);
+      assert.notEqual(codes[1], 429, `${method} ${p} is charged twice`);
+      assert.equal(codes[2], 429, `${method} ${p} is not charged`);
+    }
+    for (const [method, p] of [['GET', '/health'], ['GET', '/manifest'], ['GET', '/rpc/providers']]) {
+      const ip = `203.0.113.${++n}`;
+      for (let i = 0; i < 5; i++) assert.notEqual((await send(method, p, ip)).status, 429, `${p} is local and must stay uncharged`);
+    }
+  } finally {
+    await c.stop();
+  }
+});
+
+test('413: an oversize body gets Connection: close, and a request pipelined behind it is not answered', { timeout: 60000 }, async () => {
+  const c = await startCollator({ MAX_MSG_BYTES: '1024' });
+  try {
+    const body = 'x'.repeat(4096);
+    const data = await new Promise((resolve) => {
+      const s = net.connect(c.port, '127.0.0.1');
+      let out = '';
+      const timer = setTimeout(() => { s.destroy(); resolve(`${out} <timeout>`); }, 15000);
+      s.on('data', (d) => { out += d.toString(); });
+      s.on('error', () => {});
+      s.on('close', () => { clearTimeout(timer); resolve(out); });
+      s.write(`POST /rpc/route HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}GET /health HTTP/1.1\r\nHost: x\r\n\r\n`);
+    });
+    assert.match(data, /^HTTP\/1\.1 413 /);
+    assert.match(data, /connection: close/i);
+    assert.equal((data.match(/HTTP\/1\.1 /g) || []).length, 1, 'no response to the pipelined request on the same socket');
+    assert.doesNotMatch(data, /<timeout>/, 'the server closed the socket');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('logs: forwarding headers from a peer outside TRUST_PROXY_CIDRS are ignored and the operator is told, once', { timeout: 60000 }, async () => {
+  const c = await startCollator({});
+  try {
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${c.base}/health`, { headers: { 'x-forwarded-for': '198.51.100.9' } });
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    const hits = c.stderr().split('untrusted-forwarding-header').length - 1;
+    assert.equal(hits, 1);
+  } finally {
+    await c.stop();
+  }
+});
+
 test('N4: WebSocket connection cap is keyed on the resolved client IP, not the proxy socket', { timeout: 120000 }, async () => {
   // Without a trusted hop every socket is 127.0.0.1, so a second client is refused.
   const direct = await startCollator({ CONN_MAX_PER_IP: '1' });

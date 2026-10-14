@@ -47,21 +47,44 @@ export interface Config {
   iceServers: RTCIceServer[];
 }
 
-// The single integer-env parser for the collator. Unset or empty means the
-// default. Anything else must be a safe integer: a typo such as CONN_MAX=25six
-// aborts startup instead of silently running with the default. Every integer
-// env var goes through here (no `Number(x) || default` sites).
-export function parseIntEnv(k: string, raw: string | undefined, d: number): number {
-  const v = (raw ?? '').trim();
-  if (v === '') return d;
-  if (!/^[+-]?\d+$/.test(v) || !Number.isSafeInteger(Number(v))) {
-    throw new Error(`${k} must be an integer (got "${raw}")`);
-  }
-  return Number(v);
+// Inclusive bounds for one integer env var. Every integer env var declares its
+// own bounds; nothing is silently clamped to a floor or ceiling.
+export interface IntBounds {
+  min: number;
+  max: number;
 }
 
-export function intEnv(k: string, d: number): number {
-  return parseIntEnv(k, process.env[k], d);
+// ws reads maxPayload with `| 0`, so anything above 2^31-1 wraps negative and
+// silently disables the WebSocket size check.
+const INT32_MAX = 2147483647;
+// setTimeout/setInterval treat anything above 2^31-1 ms as 1 ms (TimeoutOverflowWarning).
+export const TIMER_MAX_MS = INT32_MAX;
+
+export function atLeast(min: number, max: number = INT32_MAX): IntBounds {
+  return { min, max };
+}
+
+// The single integer-env parser for the collator. Unset or empty means the
+// default. Anything else must be a safe integer inside `bounds`: a typo such as
+// CONN_MAX=25six, a negative cap that would disable it, or a zero that would
+// silently become a different value all abort startup instead of running with
+// something other than what was asked for. Every integer env var goes through
+// here (no `Number(x) || default` and no Math.max/min clamps).
+export function parseIntEnv(k: string, raw: string | undefined, d: number, bounds: IntBounds): number {
+  const v = (raw ?? '').trim();
+  if (v === '') return d;
+  if (!/^[+-]?\d+$/.test(v)) {
+    throw new Error(`${k} must be an integer (got "${raw}")`);
+  }
+  const n = Number(v);
+  if (!Number.isSafeInteger(n) || n < bounds.min || n > bounds.max) {
+    throw new Error(`${k} must be an integer from ${bounds.min} to ${bounds.max} (got "${raw}")`);
+  }
+  return n;
+}
+
+export function intEnv(k: string, d: number, bounds: IntBounds): number {
+  return parseIntEnv(k, process.env[k], d, bounds);
 }
 
 export function loadConfig(): Config {
@@ -96,7 +119,7 @@ export function loadConfig(): Config {
     : 'off';
 
   const ipIntelUrl = process.env.IP_INTEL_URL || null;
-  const ipIntelTtlSec = intEnv('IP_INTEL_TTL_SEC', 300);
+  const ipIntelTtlSec = intEnv('IP_INTEL_TTL_SEC', 300, atLeast(0));
 
   // If no IP intel configured, be honest: disable vpn/asn enforcement modes.
   const rawVpnMode = (process.env.VPN_FILTER_MODE || 'off').toLowerCase();
@@ -114,51 +137,50 @@ export function loadConfig(): Config {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s !== '')
-    .map((s) => parseIntEnv('ASN_BLOCKLIST', s, 0))
-    .filter((n) => n > 0);
+    .map((s) => parseIntEnv('ASN_BLOCKLIST', s, 0, atLeast(1, 4294967295)));
 
   // Support both new and old env var names.
-  const submitBurst = intEnv('SUBMIT_BURST', 10);
-  const submitRatePerSec = intEnv('SUBMIT_RPS', intEnv('SUBMIT_RATE_PER_SEC', 2));
+  const submitBurst = intEnv('SUBMIT_BURST', 10, atLeast(1));
+  const submitRatePerSec = intEnv('SUBMIT_RPS', intEnv('SUBMIT_RATE_PER_SEC', 2, atLeast(1)), atLeast(1));
 
   // H3b: sane default connection cap; CONN_MAX=0 explicitly disables the cap.
-  const connMaxConfigured = intEnv('CONN_MAX', 256);
+  const connMaxConfigured = intEnv('CONN_MAX', 256, atLeast(0));
 
   // Startup-validated: a malformed or ambiguous proxy configuration aborts the
   // process instead of silently trusting or ignoring client-IP headers.
   const trustedProxy = parseTrustedProxyConfig(process.env);
 
   // Upper bound on tape entries a single TAPE_SUB resync may replay.
-  const tapeResyncMaxEntries = Math.max(1, intEnv('TAPE_RESYNC_MAX_ENTRIES', 10000));
+  const tapeResyncMaxEntries = intEnv('TAPE_RESYNC_MAX_ENTRIES', 10000, atLeast(1));
   // Per-client-IP token bucket for the unauthenticated HTTP RPC entry points.
-  const httpRpcPerIpRps = Math.max(1, intEnv('HTTP_RPC_PER_IP_RPS', 20));
-  const httpRpcPerIpBurst = Math.max(1, intEnv('HTTP_RPC_PER_IP_BURST', 40));
+  const httpRpcPerIpRps = intEnv('HTTP_RPC_PER_IP_RPS', 20, atLeast(1));
+  const httpRpcPerIpBurst = intEnv('HTTP_RPC_PER_IP_BURST', 40, atLeast(1));
   // Concurrency caps: 0 disables. (Parsed here, not with `|| default`, which would
   // turn an explicit 0 back into the default.)
-  const connMaxPerIp = Math.max(0, intEnv('CONN_MAX_PER_IP', 16));
+  const connMaxPerIp = intEnv('CONN_MAX_PER_IP', 16, atLeast(0));
   // Hard cap on concurrent in-flight routed RPC requests.
-  const pendingRpcMax = Math.max(1, intEnv('PENDING_RPC_MAX', 1000));
-  const rpcAdvertTtlMs = Math.max(15000, intEnv('TL_COLLATOR_RPC_ADVERT_TTL_MS', 45000));
-  const connIdleTimeoutMs = Math.max(1, intEnv('CONN_IDLE_TIMEOUT_MS', 60000));
-  const connSweepIntervalMs = Math.max(1000, intEnv('CONN_SWEEP_INTERVAL_MS', 15000));
-  const connHandshakeGraceMs = Math.max(0, intEnv('CONN_HANDSHAKE_GRACE_MS', 5000));
+  const pendingRpcMax = intEnv('PENDING_RPC_MAX', 1000, atLeast(1));
+  const rpcAdvertTtlMs = intEnv('TL_COLLATOR_RPC_ADVERT_TTL_MS', 45000, atLeast(15000, TIMER_MAX_MS));
+  const connIdleTimeoutMs = intEnv('CONN_IDLE_TIMEOUT_MS', 60000, atLeast(1000, TIMER_MAX_MS));
+  const connSweepIntervalMs = intEnv('CONN_SWEEP_INTERVAL_MS', 15000, atLeast(1000, TIMER_MAX_MS));
+  const connHandshakeGraceMs = intEnv('CONN_HANDSHAKE_GRACE_MS', 5000, atLeast(0, TIMER_MAX_MS));
   // Read again per status build (bitvmStatus.ts); validated here so a typo aborts startup, not every request.
-  intEnv('BITVM_COLLATERAL_PROPERTY_ID', 1);
-  const pendingRpcMaxPerSession = Math.max(0, intEnv('PENDING_RPC_MAX_PER_SESSION', 32));
-  const pendingRpcMaxPerIp = Math.max(0, intEnv('PENDING_RPC_MAX_PER_IP', 256));
+  intEnv('BITVM_COLLATERAL_PROPERTY_ID', 1, atLeast(1));
+  const pendingRpcMaxPerSession = intEnv('PENDING_RPC_MAX_PER_SESSION', 32, atLeast(0));
+  const pendingRpcMaxPerIp = intEnv('PENDING_RPC_MAX_PER_IP', 256, atLeast(0));
 
   return {
-    port: intEnv('PORT', intEnv('SERVER_PORT', 8787)),
+    port: intEnv('PORT', intEnv('SERVER_PORT', 8787, atLeast(1, 65535)), atLeast(1, 65535)),
     wsPath: process.env.WS_PATH || '/ws',
     dataDir,
     tapePath,
     idxPath,
-    idxStride: intEnv('TAPE_INDEX_STRIDE', 1000),
-    replayBatch: intEnv('TAPE_REPLAY_BATCH', 500),
+    idxStride: intEnv('TAPE_INDEX_STRIDE', 1000, atLeast(1)),
+    replayBatch: intEnv('TAPE_REPLAY_BATCH', 500, atLeast(1)),
     collatorKeyPath,
     infraAttestationsPath: infraAttestationsPath || null,
     infraAttestationsJson,
-    maxMsgBytes: intEnv('MAX_MSG_BYTES', 1048576),
+    maxMsgBytes: intEnv('MAX_MSG_BYTES', 1048576, atLeast(1)),
     submitBurst,
     submitRatePerSec,
     clearlistEnforce,

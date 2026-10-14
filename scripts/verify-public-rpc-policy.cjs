@@ -138,20 +138,68 @@ for (const needle of [
   if (!collator.includes(needle)) throw new Error(`Collator policy missing: ${needle}`);
 }
 
-// Single HTTP admission point: httpRpcAllowed has exactly one call site, and it
-// sits in the request handler before the first body read or upstream call.
+// Single HTTP admission point: httpRpcAllowed has exactly one call site. That
+// call is the whole gate statement (charge, 429, return, no extra condition),
+// it sits at the top level of the request handler's async body (not nested in a
+// route branch), and nothing that reads the body or contacts an upstream runs
+// before it.
 {
   const calls = [...collator.matchAll(/httpRpcAllowed\(/g)].map((m) => m.index);
   if (calls.length !== 1) throw new Error(`Expected one HTTP admission call site, found ${calls.length}`);
   const handler = collator.indexOf("server.on('request'");
   const gateAt = calls[0];
   if (handler < 0 || gateAt < handler) throw new Error('HTTP admission gate must sit inside the request handler');
-  const firstBodyRead = collator.indexOf('readHttpJson(req', handler);
-  const firstUpstream = collator.indexOf('proxyLegacyJson(', handler);
-  const firstRouted = collator.indexOf('routeRpcRequest(', handler);
-  for (const at of [firstBodyRead, firstUpstream, firstRouted]) {
-    if (at >= 0 && at < gateAt) throw new Error('an HTTP body read or upstream call precedes the admission gate');
+  const gateStmt = /if \(!HTTP_UNLIMITED_PATHS\.has\(u\.pathname\) && !httpRpcAllowed\(clientIp\)\) \{\s*writeJson\(res, 429, httpRateLimitedBody\(u\.pathname\)\);\s*return;\s*\}/g;
+  const gates = [...collator.matchAll(gateStmt)];
+  if (gates.length !== 1) throw new Error(`HTTP admission gate statement must appear exactly once, found ${gates.length}`);
+  const gateStart = gates[0].index;
+  if (!(gateAt >= gateStart && gateAt < gateStart + gates[0][0].length)) throw new Error('httpRpcAllowed is not the gate statement');
+  // Brace depth at the gate: the request listener body plus the async IIFE body
+  // (two open blocks). Any deeper means the gate sits inside a route or condition.
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, collator.slice(handler, gateStart));
+  const stack = [];
+  for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+    if (kind === ts.SyntaxKind.TemplateHead) stack.push('T');
+    else if (kind === ts.SyntaxKind.OpenBraceToken) stack.push('{');
+    else if (kind === ts.SyntaxKind.CloseBraceToken && stack.pop() === 'T') {
+      if (scanner.reScanTemplateToken(false) === ts.SyntaxKind.TemplateMiddle) stack.push('T');
+    }
   }
+  if (stack.length !== 2) throw new Error(`HTTP admission gate must be a top-level statement of the request handler (brace depth ${stack.length}, expected 2)`);
+  const beforeGate = [
+    ['readHttpJson(req', 'an HTTP body read'],
+    ['proxyLegacyJson(', 'a legacy relayer call'],
+    ['routeCompatRpcRequest(', 'a compat RPC call'],
+    ['routeRpcRequest(', 'a routed RPC call'],
+    ['ipIntel.lookup(', 'an IP intel lookup'],
+    ['fetch(', 'an outbound fetch'],
+  ];
+  for (const [needle, what] of beforeGate) {
+    const at = collator.indexOf(needle, handler);
+    if (at >= 0 && at < gateStart) throw new Error(`${what} precedes the HTTP admission gate`);
+  }
+  // Exempt paths: exactly the three local status routes, no more.
+  const unlimited = collator.match(/const HTTP_UNLIMITED_PATHS = new Set\(\[([^\]]*)\]\);/);
+  if (!unlimited || unlimited[1].replace(/\s/g, '') !== "'/health','/manifest','/rpc/providers'") {
+    throw new Error('HTTP_UNLIMITED_PATHS must be exactly /health, /manifest and /rpc/providers');
+  }
+}
+
+// 413 path: the oversize body is refused with Connection: close, and the
+// read-side error is the only thing that maps to 413.
+for (const needle of [
+  "res.setHeader('Connection', 'close');",
+  "e instanceof RequestBodyTooLarge",
+  "writeJson(res, 413, { ok: false, error: { code: 'BODY_TOO_LARGE', message: 'request body too large' } });",
+]) {
+  if (!collator.includes(needle)) throw new Error(`Collator policy missing: ${needle}`);
+}
+
+// Integer env vars: one bounded parser. No Math.max/min clamp around a parsed
+// value, and every intEnv call declares its bounds (no two-argument form).
+for (const [name, text] of [['config', configSrc], ['bitvmStatus', codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'bitvmStatus.ts'), 'utf8'))]]) {
+  if (/Math\.(?:max|min)\(\s*-?\d+\s*,\s*intEnv\(/.test(text)) throw new Error(`${name}: integer env value is clamped instead of bounded`);
+  if (/intEnv\('[A-Z_]+',\s*[^,()]+\)/.test(text)) throw new Error(`${name}: intEnv call without bounds`);
 }
 
 // Peer-facing errors carry fixed text; caught exception text is logged only.
