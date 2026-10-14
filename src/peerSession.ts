@@ -19,6 +19,19 @@ export interface SessionMetaV1 {
  */
 export const DC_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Queue level a TAPE_SUB replay waits for before it sends the next entry (round 10). A replay
+ * of up to TAPE_RESYNC_MAX_ENTRIES entries is produced at CPU speed, so without pacing it fills
+ * the channel past DC_MAX_BUFFERED_BYTES in one burst and the live-feed cap closes a healthy
+ * wallet mid-resync. The wait keeps a responsive peer's queue well below that cap.
+ */
+export const DC_REPLAY_HIGH_WATER_BYTES = 1024 * 1024;
+
+/** A replay gives up on a channel whose queue has not shrunk for this long (a stalled peer). */
+export const DC_REPLAY_STALL_MS = 10_000;
+
+const DC_REPLAY_POLL_MS = 5;
+
 export class PeerSession {
   readonly id: string;
   readonly ws: WebSocket;
@@ -82,6 +95,30 @@ export class PeerSession {
 
   sendTapeEntry(entry: TapeEntryV1): boolean {
     return this.sendDc({ t: 'TAPE_ENTRY', v: 1, entry });
+  }
+
+  /**
+   * Sends one replayed entry on `channel`, waiting for the queue to drain first. Returns false,
+   * and sends nothing more, once `channel` is no longer this session's channel or is closed. A
+   * queue that does not shrink for `stallMs` closes the channel, so a stalled peer still ends the
+   * replay.
+   */
+  async sendReplayEntry(channel: RTCDataChannel, entry: TapeEntryV1, stallMs: number = DC_REPLAY_STALL_MS): Promise<boolean> {
+    let queued = channel.bufferedAmount;
+    let progressAt = Date.now();
+    while (channel.bufferedAmount > DC_REPLAY_HIGH_WATER_BYTES) {
+      if (this.dc !== channel || channel.readyState !== 'open') return false;
+      await new Promise<void>((resolve) => setTimeout(resolve, DC_REPLAY_POLL_MS));
+      if (channel.bufferedAmount < queued) {
+        queued = channel.bufferedAmount;
+        progressAt = Date.now();
+      } else if (Date.now() - progressAt > stallMs) {
+        this.dropChannel();
+        return false;
+      }
+    }
+    if (this.dc !== channel || channel.readyState !== 'open') return false;
+    return this.sendTapeEntry(entry);
   }
 
   private dropChannel(): void {

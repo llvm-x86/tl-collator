@@ -5,6 +5,18 @@ import { fetchBoundedJson } from './boundedFetch.js';
 const IP_INTEL_TIMEOUT_MS = 3000;
 const IP_INTEL_MAX_BYTES = 64 * 1024;
 
+/**
+ * True when an IP intel verdict decides admission: a `reject` mode blocks on the verdict (round 10).
+ * `log` modes and an unconfigured intel source never refuse an order because of a missing verdict.
+ */
+export function intelVerdictRequired(policy: {
+  vpnFilterMode: 'off' | 'log' | 'reject';
+  asnBlockMode: 'off' | 'log' | 'reject';
+  asnBlocklist: number[];
+}): boolean {
+  return policy.vpnFilterMode === 'reject' || (policy.asnBlockMode === 'reject' && policy.asnBlocklist.length > 0);
+}
+
 export interface IpIntel {
   asn?: number;
   vpn?: boolean;

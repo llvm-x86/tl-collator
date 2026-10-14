@@ -21,7 +21,7 @@ import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
 import { buildManifest } from './manifest.js';
-import { IpIntelClient } from './ipIntel.js';
+import { IpIntelClient, intelVerdictRequired } from './ipIntel.js';
 import { AuditLog } from './auditLog.js';
 import { buildBitvmStatusFromArtifacts } from './bitvmStatus.js';
 
@@ -1417,7 +1417,16 @@ async function main() {
                     return;
                   }
                   const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
-                  const replay = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
+                  // Paced on this channel: the replay waits for the queue to drain and stops if the
+                  // channel is replaced or closed (round 10).
+                  let interrupted = false;
+                  const replay = await tape.replayFromSeq(Math.max(1, fromSeq), async (e) => {
+                    const sent = await sess.sendReplayEntry(dc, e);
+                    if (!sent) interrupted = true;
+                    return sent;
+                  });
+                  // An interrupted replay has no end marker: TAPE_END would claim a tip the peer never received.
+                  if (interrupted) return;
                   // Optional end marker; wallets that don't understand it should ignore.
                   // `fromSeq` is the first seq actually replayed: it is greater than the
                   // requested one when the resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
@@ -1494,17 +1503,25 @@ async function main() {
                     }
                   }
 
-                  // Optional IP intel policy enforcement.
+                  // Optional IP intel policy enforcement. Round 10: when a reject mode decides admission,
+                  // a missing verdict (lookup timeout, error, or no client IP) refuses the order. Before,
+                  // a lookup that failed open let blocked VPN and ASN clients through during an intel outage.
                   if (ipIntel && (cfg.vpnFilterMode !== 'off' || cfg.asnBlockMode !== 'off')) {
                     const ip = sess.meta.remoteIp;
+                    let verdict = false;
                     if (ip) {
                       try {
                         const intel = await ipIntel.lookup(ip);
                         if (typeof intel.asn === 'number') sess.meta.asn = intel.asn;
                         if (typeof intel.vpn === 'boolean') sess.meta.vpn = intel.vpn;
-                      } catch {
-                        // ignore intel errors for now; manifest already disables enforcement if IP_INTEL_URL missing.
+                        verdict = true;
+                      } catch (e: any) {
+                        logInternalError('ip-intel-lookup', e);
                       }
+                    }
+                    if (!verdict && intelVerdictRequired(cfg)) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'INTEL_UNAVAILABLE', msg: 'ip intel unavailable' });
+                      return;
                     }
                   }
 

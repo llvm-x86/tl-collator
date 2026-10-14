@@ -200,9 +200,11 @@ export class TapeStore {
   // bounded to the newest `maxReplayEntries` entries so one TAPE_SUB cannot
   // force a full-file read; the returned `fromSeq` is the first seq actually
   // replayed, which callers must report so a clamped resync is visible.
+  // `onEntry` may wait (for example, for a channel to drain). Returning false stops the replay
+  // early; `lastSeq` is then the last entry actually delivered.
   async replayFromSeq(
     requestedFromSeq: number,
-    onEntry: (e: TapeEntryV1) => void,
+    onEntry: (e: TapeEntryV1) => boolean | void | Promise<boolean | void>,
   ): Promise<{ fromSeq: number; lastSeq: number }> {
     const fromSeq = Math.max(requestedFromSeq, this.lastSeq - this.maxReplayEntries + 1, 1);
     // Nothing to send past the tip. Returning here matters: the seek index has no
@@ -242,7 +244,9 @@ export class TapeStore {
           }
           if (!e || typeof e.seq !== 'number') continue;
           if (e.seq < fromSeq) continue;
-          onEntry(e);
+          if ((await onEntry(e)) === false) {
+            return { fromSeq, lastSeq: lastSentSeq };
+          }
           lastSentSeq = e.seq;
           sent++;
           if (sent >= this.replayBatch) {
