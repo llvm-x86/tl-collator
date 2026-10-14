@@ -34,16 +34,24 @@ export interface Config {
   tapeResyncMaxEntries: number;
   httpRpcPerIpRps: number;
   httpRpcPerIpBurst: number;
+  connMaxPerIp: number;
+  pendingRpcMaxPerSession: number;
+  pendingRpcMaxPerIp: number;
   tlsKeyPath: string | null;
   tlsCertPath: string | null;
   iceServers: RTCIceServer[];
 }
 
+// Unset or empty means the default. Anything else must be a safe integer: a
+// typo such as CONN_MAX=25six aborts startup instead of silently running with
+// the default.
 function intEnv(k: string, d: number): number {
-  const v = process.env[k];
-  if (!v) return d;
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : d;
+  const v = (process.env[k] ?? '').trim();
+  if (v === '') return d;
+  if (!/^[+-]?\d+$/.test(v) || !Number.isSafeInteger(Number(v))) {
+    throw new Error(`${k} must be an integer (got "${process.env[k]}")`);
+  }
+  return Number(v);
 }
 
 export function loadConfig(): Config {
@@ -97,7 +105,7 @@ export function loadConfig(): Config {
     .filter((n) => Number.isFinite(n) && n > 0);
 
   // Support both new and old env var names.
-  const submitBurst = intEnv('SUBMIT_BURST', intEnv('SUBMIT_BURST', 10));
+  const submitBurst = intEnv('SUBMIT_BURST', 10);
   const submitRatePerSec = intEnv('SUBMIT_RPS', intEnv('SUBMIT_RATE_PER_SEC', 2));
 
   // H3b: sane default connection cap; CONN_MAX=0 explicitly disables the cap.
@@ -112,6 +120,11 @@ export function loadConfig(): Config {
   // Per-client-IP token bucket for the unauthenticated HTTP RPC entry points.
   const httpRpcPerIpRps = Math.max(1, intEnv('HTTP_RPC_PER_IP_RPS', 20));
   const httpRpcPerIpBurst = Math.max(1, intEnv('HTTP_RPC_PER_IP_BURST', 40));
+  // Concurrency caps: 0 disables. (Parsed here, not with `|| default`, which would
+  // turn an explicit 0 back into the default.)
+  const connMaxPerIp = Math.max(0, intEnv('CONN_MAX_PER_IP', 16));
+  const pendingRpcMaxPerSession = Math.max(0, intEnv('PENDING_RPC_MAX_PER_SESSION', 32));
+  const pendingRpcMaxPerIp = Math.max(0, intEnv('PENDING_RPC_MAX_PER_IP', 256));
 
   return {
     port: intEnv('PORT', intEnv('SERVER_PORT', 8787)),
@@ -144,6 +157,9 @@ export function loadConfig(): Config {
     tapeResyncMaxEntries,
     httpRpcPerIpRps,
     httpRpcPerIpBurst,
+    connMaxPerIp,
+    pendingRpcMaxPerSession,
+    pendingRpcMaxPerIp,
     tlsKeyPath: process.env.TLS_KEY_PATH || null,
     tlsCertPath: process.env.TLS_CERT_PATH || null,
     iceServers,

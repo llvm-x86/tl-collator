@@ -29,6 +29,8 @@ export class TapeStore {
   // Byte length of the tape file, tracked across appends so the index can be
   // extended in place instead of being rebuilt (a full re-scan) after each one.
   private tapeBytes: number = 0;
+  // Set when a failed append could not be cut back: the file may end mid-line.
+  private writeFailed: boolean = false;
 
   constructor(opts: {
     tapePath: string;
@@ -56,24 +58,37 @@ export class TapeStore {
 
   private loadFromDisk() {
     if (!fs.existsSync(this.tapePath)) return;
-    const data = fs.readFileSync(this.tapePath, 'utf8');
-    const lines = data.split(/\r?\n/).filter(Boolean);
-    for (const ln of lines) {
-      try {
-        const e = JSON.parse(ln) as TapeEntryV1;
-        if (typeof e.seq === 'number' && typeof e.entryHash === 'string') {
-          if (e.seq >= this.lastSeq) {
-            this.lastSeq = e.seq;
-            this.lastHash = e.entryHash;
-          }
-        }
-        const oid = (e as any)?.order?.orderId;
-        const pk = (e as any)?.order?.traderPubKey;
-        if (typeof oid === 'string' && typeof pk === 'string') {
-          this.traderByOrderId.set(oid, pk);
-        }
-      } catch {}
+    const buf = fs.readFileSync(this.tapePath);
+    // A crash mid-append can leave an unterminated last line. Its write never
+    // completed, so it was never acknowledged; cut it off so the next append
+    // does not glue onto it.
+    const keep = buf.lastIndexOf(0x0a) + 1;
+    if (keep < buf.length) {
+      fs.truncateSync(this.tapePath, keep);
+      console.warn(JSON.stringify({ service: 'tl-collator', event: 'tape-torn-tail-truncated', bytes: buf.length - keep }));
     }
+    const lines = buf.subarray(0, keep).toString('utf8').split(/\r?\n/).filter(Boolean);
+    lines.forEach((ln, i) => {
+      // Every entry feeds the duplicate check. A damaged interior line would
+      // silently leave its orderId out of it, so refuse to start instead.
+      let e: TapeEntryV1;
+      try {
+        e = JSON.parse(ln) as TapeEntryV1;
+      } catch {
+        throw new Error(`TapeStore: tape line ${i + 1} is not valid JSON; refusing to start with an incomplete duplicate check`);
+      }
+      if (typeof e?.seq === 'number' && typeof e.entryHash === 'string') {
+        if (e.seq >= this.lastSeq) {
+          this.lastSeq = e.seq;
+          this.lastHash = e.entryHash;
+        }
+      }
+      const oid = (e as any)?.order?.orderId;
+      const pk = (e as any)?.order?.traderPubKey;
+      if (typeof oid === 'string' && typeof pk === 'string') {
+        this.traderByOrderId.set(oid, pk);
+      }
+    });
   }
 
   private loadOrBuildIndex() {
@@ -126,7 +141,11 @@ export class TapeStore {
   // Atomic check-and-append: nothing is awaited between the duplicate check and
   // the write, so two identical SUBMITs cannot both land. Returns null (and
   // writes nothing) when the orderId is already on the tape.
+  // A failed write is cut back to the pre-append length, so the file always
+  // ends on a line boundary and in-memory state (seq, hash, index) matches disk.
+  // If that cut fails too, the store refuses further appends until restart.
   append(order: OrderEnvelopeV1): TapeEntryV1 | null {
+    if (this.writeFailed) throw new Error('tape: refusing appends after an unrepaired write failure');
     if (this.traderByOrderId.has(order.orderId)) return null;
     const seq = this.lastSeq + 1;
     const prevHash = this.lastHash;
@@ -148,7 +167,12 @@ export class TapeStore {
     const entry: TapeEntryV1 = { ...base, entryHash, sigCollator };
     const line = JSON.stringify(entry) + '\n';
     const lineOffset = this.tapeBytes;
-    fs.appendFileSync(this.tapePath, line, 'utf8');
+    try {
+      fs.appendFileSync(this.tapePath, line, 'utf8');
+    } catch (err) {
+      this.cutBackTo(lineOffset);
+      throw err;
+    }
     this.tapeBytes += Buffer.byteLength(line, 'utf8');
 
     this.lastSeq = seq;
@@ -163,6 +187,14 @@ export class TapeStore {
     return entry;
   }
 
+  private cutBackTo(offset: number): void {
+    try {
+      fs.truncateSync(this.tapePath, offset);
+    } catch {
+      this.writeFailed = true;
+    }
+  }
+
   // Stream replay for backpressure. Calls onEntry for each entry. A resync is
   // bounded to the newest `maxReplayEntries` entries so one TAPE_SUB cannot
   // force a full-file read; the returned `fromSeq` is the first seq actually
@@ -172,7 +204,9 @@ export class TapeStore {
     onEntry: (e: TapeEntryV1) => void,
   ): Promise<{ fromSeq: number; lastSeq: number }> {
     const fromSeq = Math.max(requestedFromSeq, this.lastSeq - this.maxReplayEntries + 1, 1);
-    if (!fs.existsSync(this.tapePath)) return { fromSeq, lastSeq: this.lastSeq };
+    // Nothing to send past the tip. Returning here matters: the seek index has no
+    // offset for such a seq, so the scan below would read the whole file.
+    if (fromSeq > this.lastSeq || !fs.existsSync(this.tapePath)) return { fromSeq, lastSeq: this.lastSeq };
     const idx = this.idx || (this.loadOrBuildIndex(), this.idx);
     const startOffset = idx ? findStartOffset(idx, fromSeq) : 0;
 

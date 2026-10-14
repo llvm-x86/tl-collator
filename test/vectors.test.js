@@ -164,6 +164,19 @@ test('validation: values TL-Canon cannot represent are rejected before hashing',
   assert.equal(validators.validateOrderEnvelope(clone()), true);
 });
 
+test('validation: deeply nested input is refused with a reason, never a stack overflow', () => {
+  const validators = loadValidators();
+  const base = { ...vectors.orderTest.envelopeNoSig, orderId: 'ab'.repeat(32), sigTrader: '11'.repeat(64) };
+  for (const depth of [5000, 100000]) {
+    const env = JSON.parse(JSON.stringify(base));
+    env.body.extra = JSON.parse('['.repeat(depth) + ']'.repeat(depth));
+    let accepted;
+    assert.doesNotThrow(() => { accepted = validators.validateOrderEnvelope(env); }, `depth ${depth} must be a validation result`);
+    assert.equal(accepted, false, `depth ${depth}`);
+    assert.match(validators.errorsText(), /nesting/);
+  }
+});
+
 test('TL-Canon: integer-like, astral and integral-number vectors match the spec', () => {
   const ik = vectors.integerKeyTest;
   assert.equal(stableStringify(ik.input), ik.expectedCanonical);

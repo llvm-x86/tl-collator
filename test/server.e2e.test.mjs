@@ -60,18 +60,21 @@ async function startCollator(extraEnv = {}) {
   return { port, base, stop, exitCode: () => exited, stderr: () => stderr };
 }
 
-async function postRpc(base, ip) {
+// `header` names the header that carries the client IP: `cf-connecting-ip` is
+// honored only in the untrusted-peer tests (where it must be ignored), and
+// `x-forwarded-for` is the one a trusted hop appends.
+async function postRpc(base, ip, header = 'cf-connecting-ip') {
   const res = await fetch(`${base}/rpc/tl_getsyncstatus`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+    headers: { 'content-type': 'application/json', [header]: ip },
     body: '{}',
   });
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
 // Opens a WebSocket and reports whether the collator kept it (1013 = rejected).
-function openWs(port, ip) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { 'cf-connecting-ip': ip } });
+function openWs(port, ip, header = 'cf-connecting-ip') {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { [header]: ip } });
   const state = { ws, opened: false, closeCode: null };
   ws.on('error', () => {});
   ws.on('close', (code) => { state.closeCode = code; });
@@ -122,7 +125,7 @@ test('N1: HTTP routed-RPC rate limit applies per client; spoofed headers do not 
     assert.notEqual(statuses[0].status, 429);
     assert.notEqual(statuses[1].status, 429);
     assert.equal(statuses[2].status, 429);
-    assert.equal(statuses[2].body?.error?.code, 'RPC_RATE_LIMITED');
+    assert.equal(statuses[2].body?.code, 'RPC_RATE_LIMITED');
     assert.equal(statuses[3].status, 429);
   } finally {
     await c.stop();
@@ -138,9 +141,52 @@ test('N3/N1: behind a trusted hop each real client keeps its own budget', { time
   });
   try {
     for (let i = 1; i <= 6; i++) {
-      const r = await postRpc(c.base, `203.0.113.${i}`);
+      const r = await postRpc(c.base, `203.0.113.${i}`, 'x-forwarded-for');
       assert.notEqual(r.status, 429, `client ${i} must not share another client's budget`);
     }
+  } finally {
+    await c.stop();
+  }
+});
+
+test('N3: an XFF-only proxy cannot be bypassed by a client-chosen X-Real-IP (fresh IP per request)', { timeout: 120000 }, async () => {
+  // The proxy appends the real client (198.51.100.7) to X-Forwarded-For but passes
+  // the client's own X-Real-IP through untouched. Every request must share the
+  // real client's budget.
+  const c = await startCollator({
+    TRUST_PROXY: '1',
+    TRUST_PROXY_CIDRS: '127.0.0.1/32',
+    HTTP_RPC_PER_IP_BURST: '2',
+    HTTP_RPC_PER_IP_RPS: '1',
+  });
+  try {
+    const statuses = [];
+    for (let i = 1; i <= 4; i++) {
+      const res = await fetch(`${c.base}/rpc/tl_getsyncstatus`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.7', 'x-real-ip': `203.0.113.${i}` },
+        body: '{}',
+      });
+      statuses.push(res.status);
+    }
+    assert.equal(statuses[2], 429, 'the third request from the same real client is limited');
+    assert.equal(statuses[3], 429);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('N1: the per-IP HTTP limit covers every HTTP route that reaches the mesh, not only /rpc/*', { timeout: 120000 }, async () => {
+  const c = await startCollator({ HTTP_RPC_PER_IP_BURST: '2', HTTP_RPC_PER_IP_RPS: '1' });
+  try {
+    const statuses = [];
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(`${c.base}/chain/info`);
+      statuses.push(res.status);
+    }
+    assert.notEqual(statuses[0], 429);
+    assert.notEqual(statuses[1], 429);
+    assert.equal(statuses[2], 429, 'a compat route past the burst is refused');
   } finally {
     await c.stop();
   }
@@ -165,9 +211,9 @@ test('N4: WebSocket connection cap is keyed on the resolved client IP, not the p
   const proxied = await startCollator({ CONN_MAX_PER_IP: '1', TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '127.0.0.1/32' });
   const openers2 = [];
   try {
-    const a = openWs(proxied.port, '203.0.113.1');
-    const b = openWs(proxied.port, '203.0.113.2');
-    const a2 = openWs(proxied.port, '203.0.113.1');
+    const a = openWs(proxied.port, '203.0.113.1', 'x-forwarded-for');
+    const b = openWs(proxied.port, '203.0.113.2', 'x-forwarded-for');
+    const a2 = openWs(proxied.port, '203.0.113.1', 'x-forwarded-for');
     openers2.push(a, b, a2);
     assert.equal(await closedWithin(a, 300), null);
     assert.equal(await closedWithin(b, 300), null);

@@ -24,31 +24,45 @@ function scalarViolation(v: unknown): string | null {
   return null;
 }
 
-/**
- * Validation walker: returns a reason for the first value or key that TL-Canon
- * v1 cannot represent (unsafe key, non-safe-integer number, lone surrogate), or
- * null. Used by schema.ts to reject envelopes before hashing or storing them.
- */
-export function findCanonicalViolation(v: unknown): string | null {
+// Validation-layer bound on container nesting. Not a TL-Canon rule: it keeps
+// validated input well inside the recursion depth of the serializer, so an
+// accepted value can always be hashed and a hostile one is refused, never
+// turned into a stack overflow.
+export const MAX_NESTING_DEPTH = 64;
+
+function violationAt(v: unknown, depth: number): string | null {
   const scalar = scalarViolation(v);
   if (scalar) return scalar;
+  if (!Array.isArray(v) && !isPlainObject(v)) return null;
+  if (depth >= MAX_NESTING_DEPTH) return `nesting deeper than ${MAX_NESTING_DEPTH} levels`;
   if (Array.isArray(v)) {
     for (const item of v) {
-      const hit = findCanonicalViolation(item);
+      const hit = violationAt(item, depth + 1);
       if (hit) return hit;
     }
     return null;
   }
-  if (isPlainObject(v)) {
-    for (const k of Object.keys(v)) {
-      if (UNSAFE_KEYS.has(k)) return `unsafe key not allowed: ${k}`;
-      const keyProblem = scalarViolation(k);
-      if (keyProblem) return `key ${keyProblem}`;
-      const hit = findCanonicalViolation(v[k]);
-      if (hit) return hit;
-    }
+  for (const k of Object.keys(v as object)) {
+    if (UNSAFE_KEYS.has(k)) return `unsafe key not allowed: ${k}`;
+    const keyProblem = scalarViolation(k);
+    if (keyProblem) return `key ${keyProblem}`;
+    // Data properties only, as in the serializer: accessors are never invoked.
+    const desc = Object.getOwnPropertyDescriptor(v, k);
+    if (!desc || !('value' in desc)) continue;
+    const hit = violationAt(desc.value, depth + 1);
+    if (hit) return hit;
   }
   return null;
+}
+
+/**
+ * Validation walker: returns a reason for the first value or key that TL-Canon
+ * v1 cannot represent (unsafe key, non-safe-integer number, lone surrogate,
+ * nesting beyond MAX_NESTING_DEPTH), or null. Used by schema.ts and the manifest
+ * loader to reject input before hashing or storing it.
+ */
+export function findCanonicalViolation(v: unknown): string | null {
+  return violationAt(v, 0);
 }
 
 // TL-Canon v1 key order: ascending Unicode **code point** (shortest prefix

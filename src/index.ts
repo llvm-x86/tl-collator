@@ -15,8 +15,8 @@ import { TapeStore } from './tape.js';
 import { PeerSession } from './peerSession.js';
 import { isWireMsg } from './validate.js';
 import { LruMap } from './lru.js';
-import { ConcurrencyCounter, TokenBucket } from './ratelimit.js';
-import { createClientIpResolver } from './clientIp.js';
+import { ConcurrencyCounter, MinIntervalGate, TokenBucket } from './ratelimit.js';
+import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
 import { buildManifest } from './manifest.js';
@@ -211,11 +211,6 @@ async function main() {
   const clientIpResolver = createClientIpResolver(cfg.trustedProxy);
   // Hard cap on concurrent in-flight routed RPC requests (C2d/H3).
   const pendingRpcMax = Math.max(1, Number(process.env.PENDING_RPC_MAX || '') || 1000);
-  // Per-client admission cap on outstanding routed RPC requests: stops two
-  // colluding sessions (or one HTTP client IP) from filling the global
-  // pendingRpc pool and pinning a silent provider to trigger RPC_OVERLOADED for
-  // everyone else.
-  const pendingRpcMaxPerSession = Math.max(0, Number(process.env.PENDING_RPC_MAX_PER_SESSION || '') || 32);
   const legacyRelayerBaseUrl = String(
     process.env.TL_RELAY_COMPAT_UPSTREAM_URL ||
     process.env.TL_WALLET_LISTENER_URL ||
@@ -260,21 +255,22 @@ async function main() {
   const sessions = new Map<string, PeerSession>();
   const peers = new Set<PeerSession>();
   const rpcAdvertisements = new Map<PeerSession, { nodeId: string; services: RpcServiceAdvertisementV1[]; lastSeenTs: number }>();
-  // Admission identity for routed RPCs: `sess:<id>` for WebSocket requesters,
-  // `ip:<resolved client ip>` for HTTP callers (no session object exists there).
-  // One counter enforces PENDING_RPC_MAX_PER_SESSION for both, so an HTTP flood
-  // is bounded per client exactly like a WebSocket session.
-  const sessionClientKey = (sess: PeerSession): string => `sess:${sess.id}`;
-  const ipClientKey = (ip: string): string => `ip:${ip || 'unknown'}`;
+  // Routed-RPC admission. A WebSocket request is charged to its session AND to
+  // its client IP; an HTTP request only to its client IP. Sessions are cheap
+  // (CONN_MAX_PER_IP of them per IP), so the session cap alone would let one IP
+  // multiply its share; the IP cap closes that.
   const rpcAdmission = new ConcurrencyCounter();
-  // Per-client-IP token buckets for the unauthenticated HTTP RPC entry points
-  // (/rpc/route, /rpc/:method); see httpRpcAllowed.
+  const sessionAdmissionKey = (sessionId: string): string => `sess:${sessionId}`;
+  // Per-client-IP token buckets for HTTP-routed RPCs; see routeRpcRequest.
   const httpRpcBuckets = new LruMap<TokenBucket>(5000);
+  // One TAPE_SUB replay per client IP per second; sessions are cheap, so a
+  // per-session limit alone would let one IP multiply its replay rate.
+  const tapeResyncGate = new MinIntervalGate(TAPE_SUB_MIN_INTERVAL_MS, 5000);
 
   const pendingRpc = new Map<string, {
     wireId: string;
     requester?: PeerSession;
-    clientKey: string;
+    admissionKeys: string[];
     provider: PeerSession;
     providerNodeId: string;
     timer: NodeJS.Timeout;
@@ -293,7 +289,7 @@ async function main() {
     if (!pending) return null;
     clearTimeout(pending.timer);
     pendingRpc.delete(pendingKey);
-    rpcAdmission.release(pending.clientKey);
+    for (const key of pending.admissionKeys) rpcAdmission.release(key);
     return pending;
   };
 
@@ -334,10 +330,28 @@ async function main() {
     return null;
   };
 
-  // `clientKey` is the admission identity the request is charged to (see
-  // sessionClientKey / ipClientKey). `requester` is set only for WebSocket
-  // callers, who receive RPC_RES over their DataChannel.
-  const routeRpcRequest = (rpcReq: RpcRequestV1, clientKey: string, requester?: PeerSession): Promise<RpcResponseV1> => {
+  // Per-client-IP token bucket for HTTP-routed RPCs (HTTP_RPC_PER_IP_RPS / _BURST).
+  const httpRpcAllowed = (ip: string): boolean => {
+    const key = clientKeyForIp(ip);
+    let bucket = httpRpcBuckets.get(key);
+    if (!bucket) {
+      bucket = new TokenBucket({ capacity: cfg.httpRpcPerIpBurst, refillPerSec: cfg.httpRpcPerIpRps });
+      httpRpcBuckets.set(key, bucket);
+    }
+    return bucket.allow(1);
+  };
+
+  // Single enforcement point for routed RPCs. `caller.session` is set only for
+  // WebSocket callers, who receive RPC_RES over their DataChannel; every other
+  // caller is HTTP and is rate-limited per client IP here, so no HTTP route can
+  // reach the mesh without passing the limit.
+  const routeRpcRequest = (rpcReq: RpcRequestV1, caller: { ip: string; session?: PeerSession }): Promise<RpcResponseV1> => {
+    const requester = caller.session;
+    const fail = (code: string, message: string): Promise<RpcResponseV1> => {
+      const res = publicRpcError(rpcReq.id, code, message);
+      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
+      return Promise.resolve(res);
+    };
     logPortfolioHeartbeat('rpc', 'request', {
       service: rpcReq.service,
       method: rpcReq.method,
@@ -347,14 +361,13 @@ async function main() {
       sourceEndpoint: rpcReq.sourceEndpoint || null,
     });
     if (rpcReq.service !== compatRpcService) {
-      const res = publicRpcError(rpcReq.id, 'RPC_SERVICE_FORBIDDEN', 'RPC service is not available on the public mesh');
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+      return fail('RPC_SERVICE_FORBIDDEN', 'RPC service is not available on the public mesh');
     }
     if (!isPublicRpcMethod(rpcReq.method)) {
-      const res = publicRpcError(rpcReq.id, 'RPC_METHOD_FORBIDDEN', 'RPC method is not available on the public mesh');
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+      return fail('RPC_METHOD_FORBIDDEN', 'RPC method is not available on the public mesh');
+    }
+    if (!requester && !httpRpcAllowed(caller.ip)) {
+      return fail('RPC_RATE_LIMITED', 'too many RPC requests from this client; retry later');
     }
     const provider = findRpcProvider(rpcReq, requester);
     if (!provider) {
@@ -363,43 +376,31 @@ async function main() {
         method: rpcReq.method,
         network: rpcReq.network || null,
       });
-      const res: RpcResponseV1 = {
-        id: rpcReq.id,
-        ok: false,
-        error: {
-          code: 'NO_RPC_PROVIDER',
-          message: `no WebRTC RPC provider for ${rpcReq.service}${rpcReq.network ? ` on ${rpcReq.network}` : ''}`,
-        },
-      };
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+      return fail('NO_RPC_PROVIDER', `no WebRTC RPC provider for ${rpcReq.service}${rpcReq.network ? ` on ${rpcReq.network}` : ''}`);
     }
 
     const timeoutMs = Math.max(1000, Math.min(120000, Number(rpcReq.timeoutMs || 12000)));
-    // Per-client admission cap: one requester (or a colluding pair, or one HTTP
-    // client IP) must not be able to fill the global pendingRpc pool and starve
-    // every other caller.
-    if (pendingRpcMaxPerSession > 0 && rpcAdmission.get(clientKey) >= pendingRpcMaxPerSession) {
-      const res = requester
-        ? publicRpcError(rpcReq.id, 'RPC_SESSION_OVERLOADED', 'too many outstanding routed RPC requests for this session')
-        : publicRpcError(rpcReq.id, 'RPC_IP_OVERLOADED', 'too many outstanding routed RPC requests for this client');
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+    // Admission: a WebSocket request is charged to its session and to its IP, an
+    // HTTP request to its IP only. Each cap is checked before anything is charged.
+    const ipKey = clientKeyForIp(caller.ip);
+    const sessionKey = requester ? sessionAdmissionKey(requester.id) : null;
+    const admissionKeys = sessionKey ? [sessionKey, ipKey] : [ipKey];
+    if (sessionKey && cfg.pendingRpcMaxPerSession > 0 && rpcAdmission.get(sessionKey) >= cfg.pendingRpcMaxPerSession) {
+      return fail('RPC_SESSION_OVERLOADED', 'too many outstanding routed RPC requests for this session');
+    }
+    if (cfg.pendingRpcMaxPerIp > 0 && rpcAdmission.get(ipKey) >= cfg.pendingRpcMaxPerIp) {
+      return fail('RPC_IP_OVERLOADED', 'too many outstanding routed RPC requests for this client');
     }
     // C2d/H3: bound the number of concurrent in-flight routed requests.
     if (pendingRpc.size >= pendingRpcMax) {
-      const res = publicRpcError(rpcReq.id, 'RPC_OVERLOADED', 'too many pending routed RPC requests');
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+      return fail('RPC_OVERLOADED', 'too many pending routed RPC requests');
     }
     // C2c: refuse client-chosen ids that collide with an in-flight request on
     // the same provider instead of overwriting (which would orphan the earlier
     // caller's promise until timeout).
     const pendingKey = pendingRpcKey(provider.session.id, rpcReq.id);
     if (pendingRpc.has(pendingKey)) {
-      const res = publicRpcError(rpcReq.id, 'RPC_ID_COLLISION', 'request id already pending for this provider');
-      if (requester) requester.sendDc({ t: 'RPC_RES', v: 1, res });
-      return Promise.resolve(res);
+      return fail('RPC_ID_COLLISION', 'request id already pending for this provider');
     }
     logPortfolioHeartbeat('rpc', 'provider-selected', {
       service: rpcReq.service,
@@ -439,16 +440,24 @@ async function main() {
       pendingRpc.set(pendingKey, {
         wireId: rpcReq.id,
         requester,
-        clientKey,
+        admissionKeys,
         provider: provider.session,
         providerNodeId: provider.nodeId,
         timer,
         resolve,
         reject,
       });
-      rpcAdmission.acquire(clientKey);
+      for (const key of admissionKeys) rpcAdmission.acquire(key);
       provider.session.sendDc({ t: 'RPC_REQ', v: 1, req: rpcReq });
     });
+  };
+
+  // HTTP status for a failed routed RPC: overload and rate limits are 429 so
+  // callers back off, no provider is 503, anything else is 502.
+  const httpStatusForRoutedError = (code: string | undefined): number => {
+    if (code === 'NO_RPC_PROVIDER') return 503;
+    if (code === 'RPC_RATE_LIMITED' || code === 'RPC_IP_OVERLOADED') return 429;
+    return 502;
   };
 
   // H2: the legacy relayer proxy is disabled unless LEGACY_PROXY_ENABLED=1.
@@ -493,24 +502,11 @@ async function main() {
     return { statusCode: res.status, body: await readResponseBody(res) };
   };
 
-  // Per-client-IP rate limit for the unauthenticated HTTP RPC entry points.
-  // Returns false once the caller's bucket (HTTP_RPC_PER_IP_BURST, refilled at
-  // HTTP_RPC_PER_IP_RPS) is empty.
-  const httpRpcAllowed = (ip: string): boolean => {
-    const key = ipClientKey(ip);
-    let bucket = httpRpcBuckets.get(key);
-    if (!bucket) {
-      bucket = new TokenBucket({ capacity: cfg.httpRpcPerIpBurst, refillPerSec: cfg.httpRpcPerIpRps });
-      httpRpcBuckets.set(key, bucket);
-    }
-    return bucket.allow(1);
-  };
-
   const routeCompatRpcRequest = async (
     method: string,
     params: unknown[],
     replyPath: string,
-    clientKey: string,
+    clientIp: string,
   ): Promise<{ statusCode: number; body: any }> => {
     if (!isPublicRpcMethod(method)) {
       return {
@@ -525,7 +521,7 @@ async function main() {
       params,
       ...(compatRpcNetwork ? { network: compatRpcNetwork } : {}),
     };
-    const routed = await routeRpcRequest(rpcReq, clientKey);
+    const routed = await routeRpcRequest(rpcReq, { ip: clientIp });
     if (routed.ok) {
       return { statusCode: 200, body: { data: routed.result } };
     }
@@ -544,7 +540,7 @@ async function main() {
       }
     }
     return {
-      statusCode: routed.error?.code === 'NO_RPC_PROVIDER' ? 503 : routed.error?.code === 'RPC_IP_OVERLOADED' ? 429 : 502,
+      statusCode: httpStatusForRoutedError(routed.error?.code),
       body: {
         error: routed.error?.message || `compat RPC failed on ${replyPath}`,
         code: routed.error?.code || 'RPC_ERROR',
@@ -576,9 +572,8 @@ async function main() {
       const u = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
 
       // Resolve the client IP once through the trust-gated resolver; per-IP
-      // rate limits and routed-RPC admission below are keyed on it.
+      // rate limits and routed-RPC admission are keyed on it.
       const clientIp = clientIpResolver.resolve(req);
-      const clientKey = ipClientKey(clientIp);
 
       const requestOrigin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
       const originAllowed = !!requestOrigin && corsOrigins.includes(requestOrigin);
@@ -625,11 +620,12 @@ async function main() {
           return;
         }
         try {
-          // Only forward proxy headers from a trusted hop; otherwise they are
-          // client-controlled and would let callers spoof the attested IP.
+          // Forward only the headers the collator itself believes (X-Forwarded-For),
+          // and only from a trusted hop; otherwise they are client-controlled and
+          // would let callers spoof the attested IP.
           const proxyHeaders: Record<string, string> = {};
           if (clientIpResolver.headersTrusted(req)) {
-            for (const name of ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto']) {
+            for (const name of ['x-forwarded-for', 'x-forwarded-proto']) {
               const value = req.headers[name];
               if (typeof value === 'string' && value.trim()) proxyHeaders[name] = value;
             }
@@ -689,6 +685,10 @@ async function main() {
 
       if (u.pathname.startsWith('/tl_')) {
         if (req.method === 'POST' && u.pathname === '/tl_bitvmStatus') {
+          if (!httpRpcAllowed(clientIp)) {
+            writeJson(res, 429, { error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
+            return;
+          }
           const body = await readHttpJson(req, cfg.maxMsgBytes);
           writeJson(res, 200, buildBitvmStatusFromArtifacts(body || {}));
           return;
@@ -719,8 +719,9 @@ async function main() {
           writeJson(res, 403, { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
           return;
         }
-        // Per-IP rate limit on the unauthenticated /rpc/:method entry point.
-        if (!httpRpcAllowed(clientIp)) {
+        // The bitvm status builder does not go through routeRpcRequest, so it
+        // takes the per-IP gate here; routed methods are gated inside it.
+        if (method.toLowerCase() === 'tl_bitvmstatus' && !httpRpcAllowed(clientIp)) {
           writeJson(res, 429, { error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
           return;
         }
@@ -735,7 +736,7 @@ async function main() {
           pathname: u.pathname,
           paramsCount: params.length,
         });
-        const compat = await routeCompatRpcRequest(method, params, u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest(method, params, u.pathname, clientIp);
         logPortfolioHeartbeat('http', '/rpc compat response', {
           method,
           pathname: u.pathname,
@@ -747,11 +748,6 @@ async function main() {
       }
 
       if (req.method === 'POST' && u.pathname === '/rpc/route') {
-        // Per-IP rate limit on /rpc/route (same bucket as /rpc/:method).
-        if (!httpRpcAllowed(clientIp)) {
-          writeJson(res, 429, { ok: false, error: { code: 'RPC_RATE_LIMITED', message: 'too many RPC requests from this client; retry later' } });
-          return;
-        }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
         const rpcReq = normalizeRpcRequest(raw);
         if (!rpcReq) {
@@ -773,7 +769,7 @@ async function main() {
           sourceEndpoint: rpcReq.sourceEndpoint || null,
           ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
         });
-        const routed = await routeRpcRequest(rpcReq, clientKey);
+        const routed = await routeRpcRequest(rpcReq, { ip: clientIp });
         logPortfolioHeartbeat('http', '/rpc/route response', {
           service: rpcReq.service,
           method: rpcReq.method,
@@ -782,7 +778,7 @@ async function main() {
           errorCode: routed.error?.code || null,
           providerNodeId: routed.providerNodeId || null,
         });
-        writeJson(res, routed.ok ? 200 : routed.error?.code === 'NO_RPC_PROVIDER' ? 503 : 502, routed);
+        writeJson(res, routed.ok ? 200 : httpStatusForRoutedError(routed.error?.code), routed);
         return;
       }
 
@@ -795,7 +791,7 @@ async function main() {
           }
         } catch {}
         logPortfolioHeartbeat('http', '/chain/info fallback', {});
-        const compat = await routeCompatRpcRequest('getblockchaininfo', [], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('getblockchaininfo', [], u.pathname, clientIp);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -813,7 +809,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('validateaddress', [address], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('validateaddress', [address], u.pathname, clientIp);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -840,7 +836,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_getallbalancesforaddress', [address], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('tl_getallbalancesforaddress', [address], u.pathname, clientIp);
         logPortfolioHeartbeat('http', '/address/balance routed', {
           address,
           statusCode: compat.statusCode,
@@ -863,7 +859,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('sendtoaddress', [address, 1], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('sendtoaddress', [address, 1], u.pathname, clientIp);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -893,7 +889,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('listunspent', [0, 99999999, { address, ...(pubkey ? { pubkey } : {}) }], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('listunspent', [0, 99999999, { address, ...(pubkey ? { pubkey } : {}) }], u.pathname, clientIp);
         logPortfolioHeartbeat('http', '/address/utxo routed', {
           address,
           statusCode: compat.statusCode,
@@ -916,7 +912,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_gettransaction', [txid], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('tl_gettransaction', [txid], u.pathname, clientIp);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -929,7 +925,7 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_listproperties', [], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('tl_listproperties', [], u.pathname, clientIp);
         logPortfolioHeartbeat('http', '/token/list routed', {
           statusCode: compat.statusCode,
           mappedRpc: 'tl_listproperties',
@@ -949,7 +945,7 @@ async function main() {
           }
         } catch {}
         const rawtx = typeof raw?.rawtx === 'string' ? raw.rawtx : '';
-        const compat = await routeCompatRpcRequest('decoderawtransaction', [rawtx], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('decoderawtransaction', [rawtx], u.pathname, clientIp);
         writeJson(res, compat.statusCode, compat.body);
         return;
       }
@@ -964,7 +960,7 @@ async function main() {
           }
         } catch {}
         const rawTx = typeof raw?.rawTx === 'string' ? raw.rawTx : '';
-        const compat = await routeCompatRpcRequest('sendrawtransaction', [rawTx], u.pathname, clientKey);
+        const compat = await routeCompatRpcRequest('sendrawtransaction', [rawTx], u.pathname, clientIp);
         writeJson(res, compat.statusCode, { txid: compat.body?.data ?? compat.body?.result ?? compat.body });
         return;
       }
@@ -1040,7 +1036,13 @@ async function main() {
             return;
           }
         } catch {}
-        const compat = await routeCompatRpcRequest('tl_getproperty', [Number(propId)], u.pathname, clientKey);
+        // Routed calls take a numeric property id; anything else is refused here
+        // rather than sent upstream as NaN (JSON null).
+        if (!/^\d+$/.test(propId) || !Number.isSafeInteger(Number(propId))) {
+          writeJson(res, 400, { error: 'propid must be a non-negative safe integer' });
+          return;
+        }
+        const compat = await routeCompatRpcRequest('tl_getproperty', [Number(propId)], u.pathname, clientIp);
         logPortfolioHeartbeat('http', '/token/:propid routed', {
           propId: Number(propId),
           statusCode: compat.statusCode,
@@ -1054,7 +1056,9 @@ async function main() {
       res.statusCode = 404;
       res.end('not found');
     })().catch((e: any) => {
-      writeJson(res, 500, { ok: false, error: { code: 'INTERNAL', message: e?.message || String(e) } });
+      // Details go to the log only; the response must not expose internal errors.
+      console.error(JSON.stringify({ service: 'tl-collator', event: 'http-internal-error', msg: e?.message || String(e) }));
+      writeJson(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'internal error' } });
     });
   });
 
@@ -1070,7 +1074,6 @@ async function main() {
   //    established DataChannel sessions refuses new connections with 1013.
   const connIdleTimeoutMs = Math.max(1, Number(process.env.CONN_IDLE_TIMEOUT_MS || '') || 60000);
   const connSweepIntervalMs = Math.max(1000, Number(process.env.CONN_SWEEP_INTERVAL_MS || '') || 15000);
-  const connMaxPerIp = Math.max(0, Number(process.env.CONN_MAX_PER_IP || '') || 16);
   const connHandshakeGraceMs = Math.max(0, Number(process.env.CONN_HANDSHAKE_GRACE_MS || '') || 5000);
   const perIpCounts = new Map<string, number>();
 
@@ -1113,7 +1116,7 @@ async function main() {
 
     // Per-IP sub-cap first: a single source must not be able to hold a large
     // fraction of the pool (keep-alive socket floods).
-    if (connMaxPerIp > 0 && (perIpCounts.get(ipKey) || 0) >= connMaxPerIp) {
+    if (cfg.connMaxPerIp > 0 && (perIpCounts.get(ipKey) || 0) >= cfg.connMaxPerIp) {
       try {
         ws.close(1013, 'too many connections from your ip');
       } catch {}
@@ -1150,8 +1153,6 @@ async function main() {
     perIpCounts.set(ipKey, (perIpCounts.get(ipKey) || 0) + 1);
 
     let pc: any = null;
-    // H3c: per-session rate limit for full tape re-reads.
-    let lastTapeSubTs = 0;
 
     const sendSignal = (m: SignalMsg) => {
       if (ws.readyState !== ws.OPEN) return;
@@ -1240,272 +1241,277 @@ async function main() {
             sess.dc = dc;
 
             dc.onmessage = async (ev2: any) => {
-              const txt = typeof ev2.data === 'string' ? ev2.data : Buffer.from(ev2.data).toString('utf8');
-              if (txt.length > cfg.maxMsgBytes) {
-                sess.sendDc({ t: 'ERR', v: 1, code: 'msg_too_large', msg: 'message too large' });
-                try { dc.close(); } catch {}
-                return;
-              }
-              const wm = safeJsonParse(txt) as WireMsg | null;
-              if (!wm || !isWireMsg(wm)) return;
-              sess.meta.lastSeenTs = Date.now();
-              if (!schemas.validateWireMsg(wm)) {
-                sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid WireMsg schema' });
-                return;
-              }
+              try {
+                const txt = typeof ev2.data === 'string' ? ev2.data : Buffer.from(ev2.data).toString('utf8');
+                if (txt.length > cfg.maxMsgBytes) {
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'msg_too_large', msg: 'message too large' });
+                  try { dc.close(); } catch {}
+                  return;
+                }
+                const wm = safeJsonParse(txt) as WireMsg | null;
+                if (!wm || !isWireMsg(wm)) return;
+                sess.meta.lastSeenTs = Date.now();
+                if (!schemas.validateWireMsg(wm)) {
+                  sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid WireMsg schema' });
+                  return;
+                }
 
-              if (wm.t === 'PING') {
-                sess.sendDc({ t: 'PONG', v: 1, ts: wm.ts });
-                return;
-              }
+                if (wm.t === 'PING') {
+                  sess.sendDc({ t: 'PONG', v: 1, ts: wm.ts });
+                  return;
+                }
 
-              if (wm.t === 'HELLO') {
-                // Treat as ready.
-                return;
-              }
+                if (wm.t === 'HELLO') {
+                  // Treat as ready.
+                  return;
+                }
 
-              if (wm.t === 'RPC_ADVERTISE') {
-                const services = wm.services.reduce<RpcServiceAdvertisementV1[]>((accepted, service) => {
-                  if (service.service !== compatRpcService || !Array.isArray(service.methods) || service.methods.length === 0) {
+                if (wm.t === 'RPC_ADVERTISE') {
+                  const services = wm.services.reduce<RpcServiceAdvertisementV1[]>((accepted, service) => {
+                    if (service.service !== compatRpcService || !Array.isArray(service.methods) || service.methods.length === 0) {
+                      return accepted;
+                    }
+                    const methods = Array.from(new Set(service.methods
+                      .map((method) => normalizeRpcMethod(method))
+                      .filter((method) => isPublicRpcMethod(method))));
+                    if (methods.length === 0) return accepted;
+                    accepted.push({ ...service, methods });
                     return accepted;
+                  }, []);
+                  logPortfolioHeartbeat('rpc', 'advertise', {
+                    nodeId: wm.nodeId,
+                    services: services.map((service) => ({
+                      service: service.service,
+                      network: service.network || null,
+                      methods: Array.isArray(service.methods) ? service.methods.length : null,
+                    })),
+                  });
+                  if (services.length === 0) {
+                    rpcAdvertisements.delete(sess);
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'RPC_ADVERTISEMENT_REJECTED', msg: 'advertise at least one supported public RPC method' });
+                    return;
                   }
-                  const methods = Array.from(new Set(service.methods
-                    .map((method) => normalizeRpcMethod(method))
-                    .filter((method) => isPublicRpcMethod(method))));
-                  if (methods.length === 0) return accepted;
-                  accepted.push({ ...service, methods });
-                  return accepted;
-                }, []);
-                logPortfolioHeartbeat('rpc', 'advertise', {
-                  nodeId: wm.nodeId,
-                  services: services.map((service) => ({
-                    service: service.service,
-                    network: service.network || null,
-                    methods: Array.isArray(service.methods) ? service.methods.length : null,
-                  })),
-                });
-                if (services.length === 0) {
-                  rpcAdvertisements.delete(sess);
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'RPC_ADVERTISEMENT_REJECTED', msg: 'advertise at least one supported public RPC method' });
-                  return;
-                }
-                rpcAdvertisements.set(sess, {
-                  nodeId: wm.nodeId,
-                  services,
-                  lastSeenTs: Date.now(),
-                });
-                return;
-              }
-
-              if (wm.t === 'RPC_REQ') {
-                const rpcReq = normalizeRpcRequest(wm.req);
-                if (!rpcReq) {
-                  sess.sendDc({
-                    t: 'RPC_RES',
-                    v: 1,
-                    res: {
-                      id: wm.req?.id || `rpc-${randId()}`,
-                      ok: false,
-                      error: { code: 'BAD_RPC_REQUEST', message: 'service and method are required' },
-                    },
-                  });
-                  return;
-                }
-                logPortfolioHeartbeat('rpc', 'wire-request', {
-                  service: rpcReq.service,
-                  method: rpcReq.method,
-                  network: rpcReq.network || null,
-                  sourceEndpoint: rpcReq.sourceEndpoint || null,
-                  ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
-                });
-                void routeRpcRequest(rpcReq, sessionClientKey(sess), sess).catch((e: any) => {
-                  sess.sendDc({
-                    t: 'RPC_RES',
-                    v: 1,
-                    res: {
-                      id: rpcReq.id,
-                      ok: false,
-                      error: { code: 'RPC_ROUTE_ERROR', message: e?.message || String(e) },
-                    },
-                  });
-                });
-                return;
-              }
-
-              if (wm.t === 'RPC_RES') {
-                settleRpcResponse(wm.res, sess);
-                return;
-              }
-
-              if (wm.t === 'TAPE_SUB') {
-                // Register the live subscription first: the rate limit below
-                // only guards the full tape *replay* — returning early must
-                // never silently drop the client's live feed.
-                sess.wantsTape = true;
-                // H3c: rate-limit full tape re-reads per session.
-                const nowTs = Date.now();
-                if (nowTs - lastTapeSubTs < TAPE_SUB_MIN_INTERVAL_MS) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed' });
-                  return;
-                }
-                lastTapeSubTs = nowTs;
-                const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
-                const replay = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
-                // Optional end marker; wallets that don't understand it should ignore.
-                // `fromSeq` is the first seq actually replayed: it is greater than the
-                // requested one when the resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
-                sess.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
-                return;
-              }
-
-              if (wm.t === 'SUBMIT') {
-                if (!sess.submitBucket.allow(1)) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'too many SUBMIT' });
-                  return;
-                }
-                const order = (wm as any).order;
-                if (!schemas.validateOrderEnvelope(order)) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid OrderEnvelopeV1 schema' });
-                  return;
-                }
-                // Fast path only; the authoritative check is the atomic one in tape.append.
-                if (tape.hasOrder(order.orderId)) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
-                  return;
-                }
-                if (!verifyTraderSig(order.orderId, order.sigTrader, order.traderPubKey)) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'bad_sig', msg: 'sigTrader verify failed' });
-                  return;
-                }
-                // C1: bind sigTrader to the whole envelope. orderId must be the
-                // canonical derivation over every envelope field except
-                // orderId/sigTrader (TL-Canon v1) — including kind,
-                // cancelsOrderId and replacesOrderId — otherwise a harvested
-                // (orderId, sigTrader, traderPubKey, body) could be replayed
-                // with a forged CANCEL/REPLACE after a collator restart.
-                const expectedOrderId = computeEnvelopeHash(order);
-                if (order.orderId !== expectedOrderId) {
-                  sess.sendDc({
-                    t: 'ERR',
-                    v: 1,
-                    code: 'bad_order_id',
-                    msg: 'orderId must equal sha256(stableStringify(envelope minus orderId/sigTrader)), lowercase hex',
+                  rpcAdvertisements.set(sess, {
+                    nodeId: wm.nodeId,
+                    services,
+                    lastSeenTs: Date.now(),
                   });
                   return;
                 }
 
-                // Basic referential integrity: prevent third-party cancels/replaces.
-                if (order.kind === 'CANCEL') {
-                  const target = String(order.cancelsOrderId || '').trim();
-                  if (!target) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing cancelsOrderId' });
+                if (wm.t === 'RPC_REQ') {
+                  const rpcReq = normalizeRpcRequest(wm.req);
+                  if (!rpcReq) {
+                    sess.sendDc({
+                      t: 'RPC_RES',
+                      v: 1,
+                      res: {
+                        id: wm.req?.id || `rpc-${randId()}`,
+                        ok: false,
+                        error: { code: 'BAD_RPC_REQUEST', message: 'service and method are required' },
+                      },
+                    });
                     return;
                   }
-                  const owner = tape.getTraderForOrderId(target);
-                  if (!owner) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'cancelsOrderId not found' });
-                    return;
-                  }
-                  if (owner !== order.traderPubKey) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot cancel other trader order' });
-                    return;
-                  }
-                } else if (order.kind === 'REPLACE') {
-                  const target = String(order.replacesOrderId || '').trim();
-                  if (!target) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing replacesOrderId' });
-                    return;
-                  }
-                  const owner = tape.getTraderForOrderId(target);
-                  if (!owner) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'replacesOrderId not found' });
-                    return;
-                  }
-                  if (owner !== order.traderPubKey) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot replace other trader order' });
-                    return;
-                  }
+                  logPortfolioHeartbeat('rpc', 'wire-request', {
+                    service: rpcReq.service,
+                    method: rpcReq.method,
+                    network: rpcReq.network || null,
+                    sourceEndpoint: rpcReq.sourceEndpoint || null,
+                    ...summarizeRpcMethod(rpcReq.method, rpcReq.params),
+                  });
+                  void routeRpcRequest(rpcReq, { ip: remoteIp, session: sess }).catch((e: any) => {
+                    sess.sendDc({
+                      t: 'RPC_RES',
+                      v: 1,
+                      res: {
+                        id: rpcReq.id,
+                        ok: false,
+                        error: { code: 'RPC_ROUTE_ERROR', message: e?.message || String(e) },
+                      },
+                    });
+                  });
+                  return;
                 }
 
-                // Optional IP intel policy enforcement.
-                if (ipIntel && (cfg.vpnFilterMode !== 'off' || cfg.asnBlockMode !== 'off')) {
-                  const ip = sess.meta.remoteIp;
-                  if (ip) {
-                    try {
-                      const intel = await ipIntel.lookup(ip);
-                      if (typeof intel.asn === 'number') sess.meta.asn = intel.asn;
-                      if (typeof intel.vpn === 'boolean') sess.meta.vpn = intel.vpn;
-                    } catch {
-                      // ignore intel errors for now; manifest already disables enforcement if IP_INTEL_URL missing.
+                if (wm.t === 'RPC_RES') {
+                  settleRpcResponse(wm.res, sess);
+                  return;
+                }
+
+                if (wm.t === 'TAPE_SUB') {
+                  // Register the live subscription first: the rate limit below
+                  // only guards the full tape *replay* — returning early must
+                  // never silently drop the client's live feed.
+                  sess.wantsTape = true;
+                  // H3c: rate-limit full tape re-reads per client IP (not per session).
+                  if (!tapeResyncGate.allow(ipKey)) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed' });
+                    return;
+                  }
+                  const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
+                  const replay = await tape.replayFromSeq(Math.max(1, fromSeq), (e) => sess.sendTapeEntry(e));
+                  // Optional end marker; wallets that don't understand it should ignore.
+                  // `fromSeq` is the first seq actually replayed: it is greater than the
+                  // requested one when the resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
+                  sess.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
+                  return;
+                }
+
+                if (wm.t === 'SUBMIT') {
+                  if (!sess.submitBucket.allow(1)) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'too many SUBMIT' });
+                    return;
+                  }
+                  const order = (wm as any).order;
+                  if (!schemas.validateOrderEnvelope(order)) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid OrderEnvelopeV1 schema' });
+                    return;
+                  }
+                  // Fast path only; the authoritative check is the atomic one in tape.append.
+                  if (tape.hasOrder(order.orderId)) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
+                    return;
+                  }
+                  if (!verifyTraderSig(order.orderId, order.sigTrader, order.traderPubKey)) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'bad_sig', msg: 'sigTrader verify failed' });
+                    return;
+                  }
+                  // C1: bind sigTrader to the whole envelope. orderId must be the
+                  // canonical derivation over every envelope field except
+                  // orderId/sigTrader (TL-Canon v1) — including kind,
+                  // cancelsOrderId and replacesOrderId — otherwise a harvested
+                  // (orderId, sigTrader, traderPubKey, body) could be replayed
+                  // with a forged CANCEL/REPLACE after a collator restart.
+                  const expectedOrderId = computeEnvelopeHash(order);
+                  if (order.orderId !== expectedOrderId) {
+                    sess.sendDc({
+                      t: 'ERR',
+                      v: 1,
+                      code: 'bad_order_id',
+                      msg: 'orderId must equal sha256(stableStringify(envelope minus orderId/sigTrader)), lowercase hex',
+                    });
+                    return;
+                  }
+
+                  // Basic referential integrity: prevent third-party cancels/replaces.
+                  if (order.kind === 'CANCEL') {
+                    const target = String(order.cancelsOrderId || '').trim();
+                    if (!target) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing cancelsOrderId' });
+                      return;
+                    }
+                    const owner = tape.getTraderForOrderId(target);
+                    if (!owner) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'cancelsOrderId not found' });
+                      return;
+                    }
+                    if (owner !== order.traderPubKey) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot cancel other trader order' });
+                      return;
+                    }
+                  } else if (order.kind === 'REPLACE') {
+                    const target = String(order.replacesOrderId || '').trim();
+                    if (!target) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing replacesOrderId' });
+                      return;
+                    }
+                    const owner = tape.getTraderForOrderId(target);
+                    if (!owner) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'replacesOrderId not found' });
+                      return;
+                    }
+                    if (owner !== order.traderPubKey) {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot replace other trader order' });
+                      return;
                     }
                   }
-                }
 
-                if (cfg.vpnFilterMode !== 'off' && sess.meta.vpn === true) {
-                  if (cfg.vpnFilterMode === 'reject') {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'VPN_BLOCKED', msg: 'vpn traffic rejected' });
-                    return;
-                  }
-                }
-                if (cfg.asnBlockMode !== 'off' && typeof sess.meta.asn === 'number' && cfg.asnBlocklist.includes(sess.meta.asn)) {
-                  if (cfg.asnBlockMode === 'reject') {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'ASN_BLOCKED', msg: 'asn blocked' });
-                    return;
-                  }
-                }
-
-                // Optional clearlist enforcement.
-                if (cfg.clearlistEnforce) {
-                  const vis: any = order?.body?.visibility;
-                  const kind = vis?.kind;
-                  const groupId = vis?.groupId;
-                  if ((kind === 'CLEARLIST' || kind === 'DARK') && typeof groupId === 'string' && groupId) {
-                    if (!clearlist) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_CONFIG', msg: 'CLEARLIST_URL not configured' });
-                      if (cfg.clearlistFailMode === 'closed') return;
-                    } else {
+                  // Optional IP intel policy enforcement.
+                  if (ipIntel && (cfg.vpnFilterMode !== 'off' || cfg.asnBlockMode !== 'off')) {
+                    const ip = sess.meta.remoteIp;
+                    if (ip) {
                       try {
-                        const res = await clearlist.check(groupId, order.traderPubKey);
-                        if (!res.allowed) {
-                          sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_CLEARLISTED', msg: 'not clearlisted' });
-                          return;
-                        }
-                      } catch (e: any) {
-                        if (cfg.clearlistFailMode === 'closed') {
-                          sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: e?.message || String(e) });
-                          return;
+                        const intel = await ipIntel.lookup(ip);
+                        if (typeof intel.asn === 'number') sess.meta.asn = intel.asn;
+                        if (typeof intel.vpn === 'boolean') sess.meta.vpn = intel.vpn;
+                      } catch {
+                        // ignore intel errors for now; manifest already disables enforcement if IP_INTEL_URL missing.
+                      }
+                    }
+                  }
+
+                  if (cfg.vpnFilterMode !== 'off' && sess.meta.vpn === true) {
+                    if (cfg.vpnFilterMode === 'reject') {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'VPN_BLOCKED', msg: 'vpn traffic rejected' });
+                      return;
+                    }
+                  }
+                  if (cfg.asnBlockMode !== 'off' && typeof sess.meta.asn === 'number' && cfg.asnBlocklist.includes(sess.meta.asn)) {
+                    if (cfg.asnBlockMode === 'reject') {
+                      sess.sendDc({ t: 'ERR', v: 1, code: 'ASN_BLOCKED', msg: 'asn blocked' });
+                      return;
+                    }
+                  }
+
+                  // Optional clearlist enforcement.
+                  if (cfg.clearlistEnforce) {
+                    const vis: any = order?.body?.visibility;
+                    const kind = vis?.kind;
+                    const groupId = vis?.groupId;
+                    if ((kind === 'CLEARLIST' || kind === 'DARK') && typeof groupId === 'string' && groupId) {
+                      if (!clearlist) {
+                        sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_CONFIG', msg: 'CLEARLIST_URL not configured' });
+                        if (cfg.clearlistFailMode === 'closed') return;
+                      } else {
+                        try {
+                          const res = await clearlist.check(groupId, order.traderPubKey);
+                          if (!res.allowed) {
+                            sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_CLEARLISTED', msg: 'not clearlisted' });
+                            return;
+                          }
+                        } catch (e: any) {
+                          if (cfg.clearlistFailMode === 'closed') {
+                            sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: e?.message || String(e) });
+                            return;
+                          }
                         }
                       }
                     }
                   }
-                }
 
-                // Atomic duplicate check: the awaits above (IP intel, clearlist) mean
-                // an identical SUBMIT may have landed since the fast-path check.
-                const entry = tape.append(order);
-                if (!entry) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
+                  // Atomic duplicate check: the awaits above (IP intel, clearlist) mean
+                  // an identical SUBMIT may have landed since the fast-path check.
+                  const entry = tape.append(order);
+                  if (!entry) {
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
+                    return;
+                  }
+                  audit.write({
+                    ts: Date.now(),
+                    collatorId,
+                    peerId: sess.id,
+                    ip: sess.meta.remoteIp,
+                    asn: sess.meta.asn,
+                    vpn: sess.meta.vpn,
+                    orderId: order.orderId,
+                    traderPubKey: order.traderPubKey,
+                    seq: entry.seq,
+                  });
+
+                  // Broadcast to all tape subscribers (MVP: if no explicit subscribers, still broadcast).
+                  for (const p of peers) {
+                    if (!p.dc || p.dc.readyState !== 'open') continue;
+                    if (!p.wantsTape) continue;
+                    p.sendTapeEntry(entry);
+                  }
                   return;
                 }
-                audit.write({
-                  ts: Date.now(),
-                  collatorId,
-                  peerId: sess.id,
-                  ip: sess.meta.remoteIp,
-                  asn: sess.meta.asn,
-                  vpn: sess.meta.vpn,
-                  orderId: order.orderId,
-                  traderPubKey: order.traderPubKey,
-                  seq: entry.seq,
-                });
-
-                // Broadcast to all tape subscribers (MVP: if no explicit subscribers, still broadcast).
-                for (const p of peers) {
-                  if (!p.dc || p.dc.readyState !== 'open') continue;
-                  if (!p.wantsTape) continue;
-                  p.sendTapeEntry(entry);
-                }
-                return;
+              } catch (e: any) {
+                // A throw here (e.g. the tape refusing a write) must not become an
+                // unhandled rejection, which would take the whole collator down.
+                console.error(JSON.stringify({ service: 'tl-collator', event: 'dc-internal-error', msg: e?.message || String(e) }));
+                try { sess.sendDc({ t: 'ERR', v: 1, code: 'INTERNAL', msg: 'internal error' }); } catch {}
               }
             };
 

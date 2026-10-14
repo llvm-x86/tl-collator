@@ -2,8 +2,9 @@ import net from 'node:net';
 import type http from 'node:http';
 
 // Single trusted-client-IP resolver. Every per-IP decision in the collator (WS
-// connection caps, routed-RPC admission, HTTP rate limits, IP intel, logs) goes
-// through `resolve()`, so header trust is decided in exactly one place.
+// connection caps, routed-RPC admission, HTTP rate limits, TAPE_SUB resync
+// gating, IP intel, logs) goes through `resolve()`, so header trust is decided
+// in exactly one place.
 
 export interface TrustedProxyConfig {
   /** TRUST_PROXY=1: client-IP headers may be honored, but only from a peer in `cidrs`. */
@@ -13,7 +14,7 @@ export interface TrustedProxyConfig {
 }
 
 export interface ClientIpResolver {
-  /** Client IP for a request: the socket peer, or a header-derived address when the peer is a trusted hop. */
+  /** Client IP for a request: the socket peer, or an X-Forwarded-For-derived address when the peer is a trusted hop. */
   resolve(req: Pick<http.IncomingMessage, 'headers' | 'socket'>): string;
   /** True when client-IP headers on this request may be believed (peer is a configured proxy hop). */
   headersTrusted(req: Pick<http.IncomingMessage, 'socket'>): boolean;
@@ -25,14 +26,32 @@ interface ParsedCidr {
   family: 'ipv4' | 'ipv6';
 }
 
-// Canonical textual form of an address. IPv4-mapped IPv6 (`::ffff:a.b.c.d`,
-// what dual-stack sockets report) becomes `a.b.c.d`. Returns '' when the input
-// is not an IP address.
+// Canonical textual form of an address. IPv4-mapped IPv6 in either spelling
+// (`::ffff:a.b.c.d`, what dual-stack sockets report, or `::ffff:0a00:0001`)
+// becomes `a.b.c.d`; other IPv6 is returned in RFC 5952 form. Returns '' when
+// the input is not an IP address.
 export function normalizeIp(raw: string): string {
   const s = String(raw || '').trim();
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(s);
-  const candidate = mapped ? mapped[1] : s;
-  return net.isIP(candidate) ? candidate : '';
+  const family = net.isIP(s);
+  if (family === 4) return s;
+  if (family !== 6) return '';
+  let host: string;
+  try {
+    // WHATWG URL parsing produces the canonical compressed IPv6 spelling.
+    host = new URL(`http://[${s}]/`).hostname.slice(1, -1);
+  } catch {
+    return ''; // e.g. zone-scoped (`fe80::1%eth0`) addresses
+  }
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (!mapped) return host;
+  const hi = parseInt(mapped[1], 16);
+  const lo = parseInt(mapped[2], 16);
+  return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+}
+
+/** Admission / rate-limit identity for a client IP. Shared by every requester type. */
+export function clientKeyForIp(ip: string): string {
+  return `ip:${ip || 'unknown'}`;
 }
 
 function parseCidr(entry: string): ParsedCidr {
@@ -47,6 +66,11 @@ function parseCidr(entry: string): ParsedCidr {
   const prefix = m ? Number(m[2]) : maxPrefix;
   if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
     throw new Error(`TRUST_PROXY_CIDRS: "${entry}" has an invalid prefix length`);
+  }
+  // A /0 hop would make every TCP peer a trusted proxy, i.e. any client could
+  // choose its own IP. Refuse it: hops must be listed explicitly.
+  if (prefix === 0) {
+    throw new Error(`TRUST_PROXY_CIDRS: "${entry}" matches every address; list the proxy hops explicitly`);
   }
   return { addr, prefix, family: family === 4 ? 'ipv4' : 'ipv6' };
 }
@@ -100,15 +124,13 @@ export function createClientIpResolver(cfg: TrustedProxyConfig): ClientIpResolve
       // Headers are only believed when the TCP peer is one of our proxy hops.
       if (!isTrustedHop(peer)) return peer;
 
-      // Single-valued headers set by the immediate proxy/CDN.
-      for (const name of ['cf-connecting-ip', 'x-real-ip']) {
-        const ip = normalizeIp(header(req, name));
-        if (ip) return ip;
-      }
-
-      // X-Forwarded-For: walk right to left past our own hops; the first
-      // untrusted entry is the client. Anything malformed fails closed to the
-      // peer address rather than to a client-chosen value.
+      // The only client-IP header believed is X-Forwarded-For. Each hop appends
+      // the address it received the request from, so walking right to left past
+      // our own hops reaches the first address no trusted hop vouches for. The
+      // leftmost entries are client-controlled and are never consulted.
+      // Single-valued headers (cf-connecting-ip, x-real-ip) are deliberately
+      // ignored: a proxy that does not overwrite them passes a client-chosen
+      // value straight through. Malformed entries fail closed to the peer.
       const xff = header(req, 'x-forwarded-for').split(',').map((s) => s.trim()).filter(Boolean);
       for (let i = xff.length - 1; i >= 0; i--) {
         const ip = normalizeIp(xff[i]);

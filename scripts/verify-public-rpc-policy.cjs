@@ -15,6 +15,7 @@ const relayerPath = process.env.TL_RELAYER_RPC_ROUTE_SOURCE
 const collator = fs.readFileSync(collatorPath, 'utf8');
 const canonical = fs.readFileSync(canonicalPath, 'utf8');
 const clientIpSrc = fs.readFileSync(clientIpPath, 'utf8');
+const configSrc = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'config.ts'), 'utf8');
 const schemaSrc = fs.readFileSync(schemaPath, 'utf8');
 const orderSchema = fs.readFileSync(orderSchemaPath, 'utf8');
 if (!fs.existsSync(relayerPath)) {
@@ -97,7 +98,11 @@ for (const needle of [
   "'decoderawtransaction'",
   'sess.wantsTape = true;',
   "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed'",
-  'rpcAdmission.acquire(clientKey)',
+  'for (const key of admissionKeys) rpcAdmission.acquire(key);',
+  "const tapeResyncGate = new MinIntervalGate(",
+  "const admissionKeys = sessionKey ? [sessionKey, ipKey] : [ipKey];",
+  "if (!httpRpcAllowed(clientIp)) {",
+  "message: 'internal error'",
   'pendingRpcMaxPerSession',
   "code: 'RPC_RATE_LIMITED'",
   'tape.hasOrder(order.orderId)',
@@ -105,7 +110,6 @@ for (const needle of [
   "'RPC_SESSION_OVERLOADED'",
   'releasePending(pendingKey)',
   'CONN_IDLE_TIMEOUT_MS',
-  'CONN_MAX_PER_IP',
   'CONN_HANDSHAKE_GRACE_MS',
   'settleRpcResponse(wm.res, sess)',
   'pending.provider !== sender',
@@ -134,6 +138,11 @@ for (const needle of [
   'if (!isTrustedHop(peer)) return peer;',
 ]) {
   if (!clientIpSrc.includes(needle)) throw new Error(`Client IP policy missing: ${needle}`);
+}
+
+// config.ts: admission caps are parsed strictly (startup aborts on garbage).
+for (const needle of ['intEnv(\'CONN_MAX_PER_IP\'', 'intEnv(\'PENDING_RPC_MAX_PER_SESSION\'', 'throw new Error(`${k} must be an integer']) {
+  if (!configSrc.includes(needle)) throw new Error(`Config policy missing: ${needle}`);
 }
 
 // schema.ts: unsafe-key rejection before schema validation.

@@ -1,3 +1,5 @@
+import { LruMap } from './lru.js';
+
 export class TokenBucket {
   private capacity: number;
   private refillPerSec: number;
@@ -27,11 +29,26 @@ export class TokenBucket {
   }
 }
 
+// Allows at most one event per `key` every `intervalMs`. Keys are bounded (LRU),
+// so a flood of distinct keys cannot grow memory without limit.
+export class MinIntervalGate {
+  private last: LruMap<number>;
 
-// Per-client count of outstanding (admitted, not yet released) operations.
-// Routed RPCs are keyed by requester identity — `sess:<id>` for WebSocket
-// sessions, `ip:<resolved client ip>` for HTTP callers — so every route shares
-// one admission mechanism. Keys with no outstanding work are dropped.
+  constructor(private intervalMs: number, maxKeys: number) {
+    this.last = new LruMap<number>(maxKeys);
+  }
+
+  allow(key: string, nowMs: number = Date.now()): boolean {
+    const prev = this.last.get(key);
+    if (prev !== undefined && nowMs - prev < this.intervalMs) return false;
+    this.last.set(key, nowMs);
+    return true;
+  }
+}
+
+// Per-key count of outstanding (admitted, not yet released) operations, used for
+// routed-RPC admission. Keys with no outstanding work are dropped, so the map
+// only holds clients that currently have work in flight.
 export class ConcurrencyCounter {
   private counts = new Map<string, number>();
 

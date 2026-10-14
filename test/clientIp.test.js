@@ -50,11 +50,20 @@ test('N3: with no trusted hops configured, headers are ignored entirely', () => 
   assert.equal(r.resolve(req('198.51.100.7', { 'x-forwarded-for': '203.0.113.3' })), '198.51.100.7');
 });
 
-test('N3: a trusted proxy hop may supply the client IP via single-valued headers', () => {
+test('N3: single-valued client-IP headers are never believed, even from a trusted hop', () => {
+  // A proxy that only appends X-Forwarded-For passes a client-chosen
+  // X-Real-IP / CF-Connecting-IP straight through; trusting it would let every
+  // request pick a fresh IP and escape all per-IP limits.
   const r = createClientIpResolver({ enabled: true, cidrs: ['10.0.0.1/32'] });
-  assert.equal(r.resolve(req('10.0.0.1', { 'cf-connecting-ip': '203.0.113.9' })), '203.0.113.9');
-  assert.equal(r.resolve(req('10.0.0.1', { 'x-real-ip': '203.0.113.8' })), '203.0.113.8');
+  assert.equal(r.resolve(req('10.0.0.1', { 'cf-connecting-ip': '203.0.113.9' })), '10.0.0.1');
+  assert.equal(r.resolve(req('10.0.0.1', { 'x-real-ip': '203.0.113.8' })), '10.0.0.1');
+  assert.equal(r.resolve(req('10.0.0.1', { 'x-real-ip': '203.0.113.8', 'x-forwarded-for': '198.51.100.7' })), '198.51.100.7');
   assert.equal(r.headersTrusted(req('10.0.0.1')), true);
+});
+
+test('config: a /0 trusted hop (matches every peer) is refused', () => {
+  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '0.0.0.0/0' }), /matches every address/);
+  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '::/0' }), /matches every address/);
 });
 
 test('N3: X-Forwarded-For is walked right to left past trusted hops; a client-prepended entry is ignored', () => {
@@ -74,11 +83,26 @@ test('N4 input: IPv4-mapped socket addresses resolve to the same client key as p
   const r = createClientIpResolver({ enabled: true, cidrs: ['10.0.0.0/24'] });
   assert.equal(normalizeIp('::ffff:198.51.100.7'), '198.51.100.7');
   assert.equal(r.resolve(req('::ffff:198.51.100.7')), '198.51.100.7');
-  assert.equal(r.resolve(req('::ffff:10.0.0.1', { 'cf-connecting-ip': '203.0.113.9' })), '203.0.113.9');
+  assert.equal(r.resolve(req('::ffff:10.0.0.1', { 'x-forwarded-for': '203.0.113.9' })), '203.0.113.9');
+});
+
+test('N4 input: hex-spelled IPv4-mapped IPv6 canonicalizes to the dotted IPv4 key', () => {
+  // Without this, `::ffff:0a00:0001` in a header would be keyed separately from
+  // 10.0.0.1 and be treated as a different client.
+  assert.equal(normalizeIp('::ffff:a00:1'), '10.0.0.1');
+  assert.equal(normalizeIp('::FFFF:0A00:0001'), '10.0.0.1');
+  assert.equal(normalizeIp('2001:DB8::1'), '2001:db8::1');
+  assert.equal(normalizeIp('fe80::1%eth0'), '', 'zone-scoped addresses are not client IPs');
 });
 
 test('IPv6 trusted hop', () => {
   const r = createClientIpResolver({ enabled: true, cidrs: ['2001:db8::/32'] });
-  assert.equal(r.resolve(req('2001:db8::1', { 'cf-connecting-ip': '203.0.113.9' })), '203.0.113.9');
-  assert.equal(r.resolve(req('2001:db9::1', { 'cf-connecting-ip': '203.0.113.9' })), '2001:db9::1');
+  assert.equal(r.resolve(req('2001:db8::1', { 'x-forwarded-for': '203.0.113.9' })), '203.0.113.9');
+  assert.equal(r.resolve(req('2001:db9::1', { 'x-forwarded-for': '203.0.113.9' })), '2001:db9::1');
+});
+
+test('N3: spoofed X-Real-IP with an appended X-Forwarded-For resolves to the appended client', () => {
+  const r = createClientIpResolver({ enabled: true, cidrs: ['127.0.0.1/32'] });
+  const attack = req('127.0.0.1', { 'x-forwarded-for': '198.51.100.7', 'x-real-ip': '203.0.113.1' });
+  assert.equal(r.resolve(attack), '198.51.100.7');
 });
