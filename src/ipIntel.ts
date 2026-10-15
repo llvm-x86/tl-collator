@@ -12,9 +12,9 @@ export interface IpIntel {
 
 /**
  * Whether an intel answer lets an order through under the policy; `null` is no answer at all. A
- * reject mode admits only when the answer carries the field that mode reads (round 10, corrected in
- * round 11): a verdict without a `vpn` boolean or an `asn` number is as unusable as no verdict.
- * `log` modes, and an empty ASN list, never need a field.
+ * reject mode admits only when the answer carries the field that mode reads: a verdict without a
+ * `vpn` boolean or an `asn` number is as unusable as no verdict. `log` modes, and an empty ASN list,
+ * never need a field.
  */
 export function intelAdmits(
   policy: { vpnFilterMode: 'off' | 'log' | 'reject'; asnBlockMode: 'off' | 'log' | 'reject'; asnBlocklist: number[] },
