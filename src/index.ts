@@ -724,7 +724,7 @@ async function main() {
             isDarkweb: false,
             isAnonymousVpn: false,
             isBlocked,
-            source: ipIntel ? 'unknown' : 'unknown',
+            source: 'unknown',
             message: isBlocked ? 'Suspicious IP detected.' : 'IP is clean and trusted.',
           });
           return;
@@ -1195,7 +1195,7 @@ async function main() {
       return;
     }
 
-    if (typeof cfg.connMax === 'number' && cfg.connMax >= 0 && peers.size >= cfg.connMax) {
+    if (cfg.connMax !== null && peers.size >= cfg.connMax) {
       // Handshake reserve: reclaim room for this handshake before refusing.
       reapIdleSilentSessions();
       let victim: PeerSession | null = null;
@@ -1243,7 +1243,6 @@ async function main() {
         pc?.close?.();
       } catch {}
       pc = null;
-      const ipKey = clientKey(sess.meta.remoteIp || '');
       const remaining = (perIpCounts.get(ipKey) || 1) - 1;
       if (remaining > 0) perIpCounts.set(ipKey, remaining);
       else perIpCounts.delete(ipKey);
