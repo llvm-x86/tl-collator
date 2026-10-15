@@ -5,21 +5,25 @@ import { fetchBoundedJson } from './boundedFetch.js';
 const IP_INTEL_TIMEOUT_MS = 3000;
 const IP_INTEL_MAX_BYTES = 64 * 1024;
 
-/**
- * True when an IP intel verdict decides admission: a `reject` mode blocks on the verdict (round 10).
- * `log` modes and an unconfigured intel source never refuse an order because of a missing verdict.
- */
-export function intelVerdictRequired(policy: {
-  vpnFilterMode: 'off' | 'log' | 'reject';
-  asnBlockMode: 'off' | 'log' | 'reject';
-  asnBlocklist: number[];
-}): boolean {
-  return policy.vpnFilterMode === 'reject' || (policy.asnBlockMode === 'reject' && policy.asnBlocklist.length > 0);
-}
-
 export interface IpIntel {
   asn?: number;
   vpn?: boolean;
+}
+
+/**
+ * Whether an intel answer lets an order through under the policy; `null` is no answer at all. A
+ * reject mode admits only when the answer carries the field that mode reads (round 10, corrected in
+ * round 11): a verdict without a `vpn` boolean or an `asn` number is as unusable as no verdict.
+ * `log` modes, and an empty ASN list, never need a field.
+ */
+export function intelAdmits(
+  policy: { vpnFilterMode: 'off' | 'log' | 'reject'; asnBlockMode: 'off' | 'log' | 'reject'; asnBlocklist: number[] },
+  intel: IpIntel | null,
+): boolean {
+  const needsVpn = policy.vpnFilterMode === 'reject';
+  const needsAsn = policy.asnBlockMode === 'reject' && policy.asnBlocklist.length > 0;
+  if (!needsVpn && !needsAsn) return true;
+  return intel !== null && (!needsVpn || typeof intel.vpn === 'boolean') && (!needsAsn || typeof intel.asn === 'number');
 }
 
 export class IpIntelClient {
@@ -48,9 +52,11 @@ export class IpIntelClient {
       { timeoutMs: IP_INTEL_TIMEOUT_MS, maxBytes: IP_INTEL_MAX_BYTES },
     );
     if (!res.ok) throw new Error(`ipIntel http ${res.status}`);
+    // A field is kept only in its documented type. Coercion (`Number(null)` is 0) would turn a missing
+    // or malformed answer into a verdict.
     const j: any = res.body;
     const v: IpIntel = {
-      asn: Number.isFinite(Number(j?.asn)) ? Number(j.asn) : undefined,
+      asn: Number.isInteger(j?.asn) && j.asn >= 1 && j.asn <= 4294967295 ? j.asn : undefined,
       vpn: typeof j?.vpn === 'boolean' ? j.vpn : undefined,
     };
     this.cache.set(ip, { exp: now + this.ttlMs, v });

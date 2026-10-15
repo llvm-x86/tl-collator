@@ -1,7 +1,7 @@
 import { computeEnvelopeHash } from './canonical.js';
 import { verifyTraderSig } from './crypto.js';
 import type { ClearlistResult } from './clearlist.js';
-import { intelVerdictRequired, type IpIntel } from './ipIntel.js';
+import { intelAdmits, type IpIntel } from './ipIntel.js';
 import { logInternalError } from './log.js';
 import type { SessionMetaV1 } from './peerSession.js';
 import type { OrderEnvelopeV1 } from './types.js';
@@ -75,22 +75,20 @@ export async function admitOrder(
     if (owner !== order.traderPubKey) return refuse('NOT_OWNER', 'cannot replace other trader order');
   }
 
-  // IP intel policy. A reject mode needs a verdict: a lookup that fails, or a session with no client
-  // IP, refuses the order (fail closed). Log modes and an unconfigured source never refuse on it.
-  if (src.intel && (policy.vpnFilterMode !== 'off' || policy.asnBlockMode !== 'off')) {
-    const ip = meta.remoteIp;
-    let verdict = false;
-    if (ip) {
+  // IP intel policy. A reject mode admits only on a usable answer (intelAdmits): a failed lookup, no
+  // client IP, or no intel source refuses the order. Log modes never refuse on intel.
+  if (policy.vpnFilterMode !== 'off' || policy.asnBlockMode !== 'off') {
+    let intel: IpIntel | null = null;
+    if (src.intel && meta.remoteIp) {
       try {
-        const intel = await src.intel.lookup(ip);
+        intel = await src.intel.lookup(meta.remoteIp);
         if (typeof intel.asn === 'number') meta.asn = intel.asn;
         if (typeof intel.vpn === 'boolean') meta.vpn = intel.vpn;
-        verdict = true;
       } catch (e: any) {
         logInternalError('ip-intel-lookup', e);
       }
     }
-    if (!verdict && intelVerdictRequired(policy)) return refuse('INTEL_UNAVAILABLE', 'ip intel unavailable');
+    if (!intelAdmits(policy, intel)) return refuse('INTEL_UNAVAILABLE', 'ip intel unavailable');
   }
   if (policy.vpnFilterMode !== 'off' && meta.vpn === true && policy.vpnFilterMode === 'reject') {
     return refuse('VPN_BLOCKED', 'vpn traffic rejected');

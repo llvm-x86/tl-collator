@@ -209,12 +209,12 @@ test('R10-REPLAY a replay stops when its channel is replaced by a newer one', as
 
 test('R10-INTEL a reject mode needs an intel verdict; log modes and an empty ASN list do not', () => {
   const base = { vpnFilterMode: 'off', asnBlockMode: 'off', asnBlocklist: [] };
-  assert.equal(ipIntel.intelVerdictRequired(base), false);
-  assert.equal(ipIntel.intelVerdictRequired({ ...base, vpnFilterMode: 'log' }), false);
-  assert.equal(ipIntel.intelVerdictRequired({ ...base, vpnFilterMode: 'reject' }), true);
-  assert.equal(ipIntel.intelVerdictRequired({ ...base, asnBlockMode: 'log', asnBlocklist: [64500] }), false);
-  assert.equal(ipIntel.intelVerdictRequired({ ...base, asnBlockMode: 'reject' }), false);
-  assert.equal(ipIntel.intelVerdictRequired({ ...base, asnBlockMode: 'reject', asnBlocklist: [64500] }), true);
+  assert.equal(ipIntel.intelAdmits(base, null), true);
+  assert.equal(ipIntel.intelAdmits({ ...base, vpnFilterMode: 'log' }, null), true);
+  assert.equal(ipIntel.intelAdmits({ ...base, vpnFilterMode: 'reject' }, null), false);
+  assert.equal(ipIntel.intelAdmits({ ...base, asnBlockMode: 'log', asnBlocklist: [64500] }, null), true);
+  assert.equal(ipIntel.intelAdmits({ ...base, asnBlockMode: 'reject' }, null), true);
+  assert.equal(ipIntel.intelAdmits({ ...base, asnBlockMode: 'reject', asnBlocklist: [64500] }, null), false);
 });
 
 test('R10-INTEL a hung intel answer is an error for the caller (the policy path refuses on it)', { timeout: 20000 }, async () => {

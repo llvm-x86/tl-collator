@@ -4,10 +4,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
 import { admitOrder } from '../dist/orderAdmission.js';
+import { IpIntelClient, intelAdmits } from '../dist/ipIntel.js';
 import { computeEnvelopeHash } from '../dist/canonical.js';
 import { pubKeyFromPrivKeyHex, signWithPrivKeyHex } from '../dist/crypto.js';
 import { TapeStore } from '../dist/tape.js';
@@ -249,6 +251,66 @@ test('admission: a clearlist-gated order is checked with its group and trader ke
     const probe = clearlistStub({ allowed: false });
     assert.equal(await admitOrder(gated, { tape, intel: null, clearlist: probe }, meta(), signed()), null);
     assert.equal(probe.calls.length, 0, 'a PUBLIC order is not checked against the clearlist');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- intel verdicts
+
+const VPN_REJECT = { ...NO_POLICY, vpnFilterMode: 'reject' };
+const ASN_REJECT = { ...NO_POLICY, asnBlockMode: 'reject', asnBlocklist: [64500] };
+
+test('intel: an admitting verdict carries every field a reject mode reads', () => {
+  assert.equal(intelAdmits(VPN_REJECT, { vpn: false }), true);
+  assert.equal(intelAdmits(VPN_REJECT, { asn: 64500 }), false, 'a vpn reject admitted a verdict with no vpn field');
+  assert.equal(intelAdmits(ASN_REJECT, { vpn: false }), false, 'an asn reject admitted a verdict with no asn field');
+  assert.equal(intelAdmits(ASN_REJECT, { asn: 64501 }), true);
+  assert.equal(intelAdmits(VPN_REJECT, null), false);
+  assert.equal(intelAdmits({ ...NO_POLICY, asnBlockMode: 'reject' }, null), true, 'an empty ASN list needs no verdict');
+  assert.equal(intelAdmits({ ...NO_POLICY, vpnFilterMode: 'log', asnBlockMode: 'log', asnBlocklist: [64500] }, null), true);
+});
+
+test('intel: the client keeps asn and vpn only when they have the documented types', async () => {
+  let body = null;
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(body));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const client = new IpIntelClient({ url: `http://127.0.0.1:${server.address().port}/intel`, ttlSec: 0, max: 10 });
+  try {
+    body = { asn: null, vpn: 'yes' };
+    assert.deepEqual(await client.lookup('198.51.100.1'), { asn: undefined, vpn: undefined });
+    body = { asn: '64500', vpn: 1 };
+    assert.deepEqual(await client.lookup('198.51.100.2'), { asn: undefined, vpn: undefined });
+    body = { asn: 0, vpn: false };
+    assert.deepEqual(await client.lookup('198.51.100.3'), { asn: undefined, vpn: false });
+    body = { asn: 64500, vpn: true };
+    assert.deepEqual(await client.lookup('198.51.100.4'), { asn: 64500, vpn: true });
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('intel: an incomplete verdict refuses in a reject mode, through the admission path', async () => {
+  const { tape, dir } = openTape();
+  try {
+    assert.equal(await refusalOf(VPN_REJECT, { tape, intel: intelStub({}), clearlist: null }, meta(), signed()), 'INTEL_UNAVAILABLE');
+    assert.equal(await refusalOf(ASN_REJECT, { tape, intel: intelStub({ vpn: false }), clearlist: null }, meta(), signed()), 'INTEL_UNAVAILABLE');
+    assert.equal(await refusalOf(ASN_REJECT, { tape, intel: intelStub({ asn: null }), clearlist: null }, meta(), signed()), 'INTEL_UNAVAILABLE');
+    const logOnly = { ...NO_POLICY, asnBlockMode: 'log', asnBlocklist: [64500] };
+    assert.equal(await refusalOf(logOnly, { tape, intel: intelStub({ vpn: false }), clearlist: null }, meta(), signed()), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('intel: a reject mode with no intel source refuses rather than admitting unchecked', async () => {
+  const { tape, dir } = openTape();
+  try {
+    assert.equal(await refusalOf(VPN_REJECT, { tape, intel: null, clearlist: null }, meta(), signed()), 'INTEL_UNAVAILABLE');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
