@@ -393,6 +393,17 @@ async function main() {
     return httpRpcGlobal ? httpRpcGlobal.allow(1) : true;
   };
 
+  // The public-mesh allowlist, checked once for every route that can reach a provider (HTTP, WebRTC).
+  const publicRouteRefusal = (service: string, method: string): { code: string; message: string } | null => {
+    if (service !== compatRpcService) {
+      return { code: 'RPC_SERVICE_FORBIDDEN', message: 'RPC service is not available on the public mesh' };
+    }
+    if (!isPublicRpcMethod(method)) {
+      return { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' };
+    }
+    return null;
+  };
+
   // Routed-RPC admission for one request. `caller.session` is set only for
   // WebSocket callers, who receive RPC_RES over their DataChannel. HTTP callers
   // are rate-limited per client IP by httpRpcAllowed at the HTTP entry point,
@@ -412,12 +423,8 @@ async function main() {
       requester: requester?.id || null,
       sourceEndpoint: rpcReq.sourceEndpoint || null,
     });
-    if (rpcReq.service !== compatRpcService) {
-      return fail('RPC_SERVICE_FORBIDDEN', 'RPC service is not available on the public mesh');
-    }
-    if (!isPublicRpcMethod(rpcReq.method)) {
-      return fail('RPC_METHOD_FORBIDDEN', 'RPC method is not available on the public mesh');
-    }
+    const refusal = publicRouteRefusal(rpcReq.service, rpcReq.method);
+    if (refusal) return fail(refusal.code, refusal.message);
     const provider = findRpcProvider(rpcReq, requester);
     if (!provider) {
       logPortfolioHeartbeat('rpc', 'no-provider', {
@@ -562,12 +569,8 @@ async function main() {
     replyPath: string,
     clientIp: string,
   ): Promise<{ statusCode: number; body: any }> => {
-    if (!isPublicRpcMethod(method)) {
-      return {
-        statusCode: 403,
-        body: { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } },
-      };
-    }
+    const refusal = publicRouteRefusal(compatRpcService, method);
+    if (refusal) return { statusCode: 403, body: { error: refusal } };
     const rpcReq: RpcRequestV1 = {
       id: `rpc-${randId()}`,
       service: compatRpcService,
@@ -784,8 +787,9 @@ async function main() {
           writeJson(res, 400, { error: { code: 'BAD_RPC_REQUEST', message: 'Missing RPC method' } });
           return;
         }
-        if (!isPublicRpcMethod(method)) {
-          writeJson(res, 403, { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
+        const compatRefusal = publicRouteRefusal(compatRpcService, method);
+        if (compatRefusal) {
+          writeJson(res, 403, { error: compatRefusal });
           return;
         }
         const raw = await readHttpJson(req, cfg.maxMsgBytes);
@@ -817,12 +821,9 @@ async function main() {
           writeJson(res, 400, { ok: false, error: { code: 'BAD_RPC_REQUEST', message: 'service and method are required' } });
           return;
         }
-        if (rpcReq.service !== compatRpcService) {
-          writeJson(res, 403, { ok: false, error: { code: 'RPC_SERVICE_FORBIDDEN', message: 'RPC service is not available on the public mesh' } });
-          return;
-        }
-        if (!isPublicRpcMethod(rpcReq.method)) {
-          writeJson(res, 403, { ok: false, error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } });
+        const routeRefusal = publicRouteRefusal(rpcReq.service, rpcReq.method);
+        if (routeRefusal) {
+          writeJson(res, 403, { ok: false, error: routeRefusal });
           return;
         }
         logPortfolioHeartbeat('http', '/rpc/route request', {

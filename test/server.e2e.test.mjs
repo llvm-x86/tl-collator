@@ -388,3 +388,26 @@ test('N4: a handshake that displaces a silent session frees its slot at once; a 
     await c.stop();
   }
 });
+
+test('routes: a call outside the public mesh allowlist gets the same fixed 403 on every HTTP route', { timeout: 120000 }, async () => {
+  const c = await startCollator({});
+  const post = async (p, body) => {
+    const res = await fetch(`${c.base}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() };
+  };
+  try {
+    const method = { ok: false, error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } };
+    const service = { ok: false, error: { code: 'RPC_SERVICE_FORBIDDEN', message: 'RPC service is not available on the public mesh' } };
+    assert.deepEqual(await post('/rpc/route', { service: 'tradelayer.rpc', method: 'sendtoaddress' }), { status: 403, body: method });
+    assert.deepEqual(await post('/rpc/route', { service: 'other.svc', method: 'tl_getinfo' }), { status: 403, body: service });
+    assert.deepEqual(await post('/rpc/sendtoaddress', {}), {
+      status: 403,
+      body: { error: { code: 'RPC_METHOD_FORBIDDEN', message: 'RPC method is not available on the public mesh' } },
+    });
+    const allowed = await post('/rpc/route', { service: 'tradelayer.rpc', method: 'TL_GETINFO' });
+    assert.equal(allowed.status, 503, 'an allowlisted method is routed, not refused');
+    assert.equal(allowed.body.error.code, 'NO_RPC_PROVIDER');
+  } finally {
+    await c.stop();
+  }
+});
