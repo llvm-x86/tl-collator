@@ -166,6 +166,7 @@ test('config: the policy switches are spelled exactly; a misspelled one aborts s
     assert.throws(() => loadConfig(), /CLEARLIST_ENFORCE must be one of 0, 1/);
   });
   withEnv({ CLEARLIST_FAIL_MODE: 'opn' }, () => assert.throws(() => loadConfig(), /CLEARLIST_FAIL_MODE must be one of open, closed/));
+  withEnv({ CLEARLIST_FAIL_MODE: 'OPEN' }, () => assert.throws(() => loadConfig(), /CLEARLIST_FAIL_MODE must be one of open, closed/));
   withEnv({ IP_LOGGING: 'yes' }, () => assert.throws(() => loadConfig(), /IP_LOGGING must be one of/));
   withEnv({ VPN_FILTER_MODE: 'rejct', IP_INTEL_URL: 'http://127.0.0.1:9/intel' }, () => {
     assert.throws(() => loadConfig(), /VPN_FILTER_MODE must be one of off, log, reject/);

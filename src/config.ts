@@ -99,10 +99,11 @@ export function intEnv(k: string, d: number, bounds: IntBounds): number {
 }
 
 // The single parser for enumerated policy switches. Unset or empty means the
-// default; any other value must be one of `choices` (case-insensitive). A
-// misspelled mode such as `rejct` must not read as `off`.
+// default; any other value must be spelled exactly as one of `choices`. A
+// misspelled mode such as `rejct` must not read as `off`, and a case variant of
+// `open` must not read as a different fail mode.
 export function parseChoiceEnv<T extends string>(k: string, raw: string | undefined, d: T, choices: readonly T[]): T {
-  const v = (raw ?? '').trim().toLowerCase();
+  const v = (raw ?? '').trim();
   if (v === '') return d;
   const hit = choices.find((c) => c === v);
   if (hit === undefined) {
@@ -150,8 +151,8 @@ export function loadConfig(): Config {
   // A verdict-driven mode needs the intel source it reads from. Refusing the
   // combination keeps a configured block from being silently inert.
   const intelModes = ['off', 'log', 'reject'] as const;
-  const vpnFilterMode = parseChoiceEnv('VPN_FILTER_MODE', process.env.VPN_FILTER_MODE, 'off', intelModes);
-  const asnBlockMode = parseChoiceEnv('ASN_BLOCK_MODE', process.env.ASN_BLOCK_MODE, 'off', intelModes);
+  const vpnFilterMode = parseChoiceEnv('VPN_FILTER_MODE', (process.env.VPN_FILTER_MODE || '').toLowerCase(), 'off', intelModes);
+  const asnBlockMode = parseChoiceEnv('ASN_BLOCK_MODE', (process.env.ASN_BLOCK_MODE || '').toLowerCase(), 'off', intelModes);
   if (!ipIntelUrl) {
     if (vpnFilterMode !== 'off') throw new Error(`VPN_FILTER_MODE=${vpnFilterMode} requires IP_INTEL_URL`);
     if (asnBlockMode !== 'off') throw new Error(`ASN_BLOCK_MODE=${asnBlockMode} requires IP_INTEL_URL`);
