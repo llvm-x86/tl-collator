@@ -37,6 +37,7 @@ const relayerPath = process.env.TL_RELAYER_RPC_ROUTE_SOURCE
 const collator = codeOnly(fs.readFileSync(collatorPath, 'utf8'));
 const canonical = codeOnly(fs.readFileSync(canonicalPath, 'utf8'));
 const clientIpSrc = codeOnly(fs.readFileSync(clientIpPath, 'utf8'));
+const admissionSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'orderAdmission.ts'), 'utf8'));
 const configSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'config.ts'), 'utf8'));
 const schemaSrc = codeOnly(fs.readFileSync(schemaPath, 'utf8'));
 const orderSchema = fs.readFileSync(orderSchemaPath, 'utf8');
@@ -112,8 +113,7 @@ for (const needle of [
   // Adversarial review fixes (batch 2): envelope-bound orderId (C1 complete),
   // endpoint allowlist regression (H2), connection fairness (H3b), TAPE_SUB
   // subscription survival, XFF rightmost hop, per-session pending RPC cap.
-  'computeEnvelopeHash(order)',
-  "code: 'bad_order_id'",
+  'admitOrder(cfg, { tape, intel: ipIntel, clearlist }, sess.meta, order)',
   "'getblockchaininfo'",
   "'validateaddress'",
   "'listunspent'",
@@ -134,7 +134,6 @@ for (const needle of [
   "code: 'RPC_RATE_LIMITED'",
   "message: 'internal error'",
   'pendingRpcMaxPerSession',
-  'tape.hasOrder(order.orderId)',
   'if (!entry) {',
   "'RPC_SESSION_OVERLOADED'",
   'releasePending(pendingKey)',
@@ -226,6 +225,17 @@ if (/Number\(\s*process\.env/.test(fs.readFileSync(path.resolve(__dirname, '..',
 }
 
 // canonical.ts: own-key-safe canonicalization + envelope-hash derivation.
+// SUBMIT admission: one module decides every refusal, in order (orderAdmission.ts).
+for (const needle of [
+  'src.tape.hasOrder(order.orderId)',
+  'computeEnvelopeHash(order)',
+  "'bad_order_id'",
+  "'INTEL_UNAVAILABLE'",
+  "'CLEARLIST_DOWN'",
+]) {
+  if (!admissionSrc.includes(needle)) throw new Error(`Admission policy missing: ${needle}`);
+}
+
 for (const needle of [
   "new Set(['__proto__', 'constructor', 'prototype'])",
   'Object.create(null)',

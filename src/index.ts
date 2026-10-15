@@ -9,8 +9,7 @@ import wrtc from 'wrtc';
 
 import { loadConfig } from './config.js';
 import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg, WireMsg } from './types.js';
-import { verifyTraderSig, ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
-import { computeEnvelopeHash } from './canonical.js';
+import { ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
 import { TapeStore } from './tape.js';
 import { PeerSession, broadcastTapeEntry } from './peerSession.js';
 import { fetchBoundedJson } from './boundedFetch.js';
@@ -21,9 +20,11 @@ import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
 import { buildManifest } from './manifest.js';
-import { IpIntelClient, intelVerdictRequired } from './ipIntel.js';
+import { IpIntelClient } from './ipIntel.js';
 import { AuditLog } from './auditLog.js';
 import { buildBitvmStatusFromArtifacts } from './bitvmStatus.js';
+import { admitOrder } from './orderAdmission.js';
+import { logInternalError } from './log.js';
 
 const PUBLIC_RPC_METHODS = new Set([
   'tl_getstatesnapshot',
@@ -61,12 +62,6 @@ const PUBLIC_RPC_METHODS = new Set([
   'listunspent',
   'decoderawtransaction',
 ]);
-
-// Internal error detail goes to the log only. Peer-facing responses carry fixed text.
-function logInternalError(event: string, e: unknown): void {
-  const msg = e instanceof Error ? e.message : String(e);
-  console.error(JSON.stringify({ service: 'tl-collator', event, msg }));
-}
 
 function normalizeRpcMethod(method: unknown): string {
   return String(method || '').trim().toLowerCase();
@@ -1444,121 +1439,10 @@ async function main() {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid OrderEnvelopeV1 schema' });
                     return;
                   }
-                  // Fast path only; the authoritative check is the atomic one in tape.append.
-                  if (tape.hasOrder(order.orderId)) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'DUPLICATE', msg: 'orderId already seen' });
+                  const refusal = await admitOrder(cfg, { tape, intel: ipIntel, clearlist }, sess.meta, order);
+                  if (refusal) {
+                    sess.sendDc({ t: 'ERR', v: 1, ...refusal });
                     return;
-                  }
-                  if (!verifyTraderSig(order.orderId, order.sigTrader, order.traderPubKey)) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'bad_sig', msg: 'sigTrader verify failed' });
-                    return;
-                  }
-                  // C1: bind sigTrader to the whole envelope. orderId must be the
-                  // canonical derivation over every envelope field except
-                  // orderId/sigTrader (TL-Canon v1) — including kind,
-                  // cancelsOrderId and replacesOrderId — otherwise a harvested
-                  // (orderId, sigTrader, traderPubKey, body) could be replayed
-                  // with a forged CANCEL/REPLACE after a collator restart.
-                  const expectedOrderId = computeEnvelopeHash(order);
-                  if (order.orderId !== expectedOrderId) {
-                    sess.sendDc({
-                      t: 'ERR',
-                      v: 1,
-                      code: 'bad_order_id',
-                      msg: 'orderId must equal sha256(stableStringify(envelope minus orderId/sigTrader)), lowercase hex',
-                    });
-                    return;
-                  }
-
-                  // Basic referential integrity: prevent third-party cancels/replaces.
-                  if (order.kind === 'CANCEL') {
-                    const target = String(order.cancelsOrderId || '').trim();
-                    if (!target) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing cancelsOrderId' });
-                      return;
-                    }
-                    const owner = tape.getTraderForOrderId(target);
-                    if (!owner) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'cancelsOrderId not found' });
-                      return;
-                    }
-                    if (owner !== order.traderPubKey) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot cancel other trader order' });
-                      return;
-                    }
-                  } else if (order.kind === 'REPLACE') {
-                    const target = String(order.replacesOrderId || '').trim();
-                    if (!target) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'missing replacesOrderId' });
-                      return;
-                    }
-                    const owner = tape.getTraderForOrderId(target);
-                    if (!owner) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'UNKNOWN_ORDER', msg: 'replacesOrderId not found' });
-                      return;
-                    }
-                    if (owner !== order.traderPubKey) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_OWNER', msg: 'cannot replace other trader order' });
-                      return;
-                    }
-                  }
-
-                  // Optional IP intel policy enforcement. Round 10: when a reject mode decides admission,
-                  // a missing verdict (lookup timeout, error, or no client IP) refuses the order. Before,
-                  // a lookup that failed open let blocked VPN and ASN clients through during an intel outage.
-                  if (ipIntel && (cfg.vpnFilterMode !== 'off' || cfg.asnBlockMode !== 'off')) {
-                    const ip = sess.meta.remoteIp;
-                    let verdict = false;
-                    if (ip) {
-                      try {
-                        const intel = await ipIntel.lookup(ip);
-                        if (typeof intel.asn === 'number') sess.meta.asn = intel.asn;
-                        if (typeof intel.vpn === 'boolean') sess.meta.vpn = intel.vpn;
-                        verdict = true;
-                      } catch (e: any) {
-                        logInternalError('ip-intel-lookup', e);
-                      }
-                    }
-                    if (!verdict && intelVerdictRequired(cfg)) {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'INTEL_UNAVAILABLE', msg: 'ip intel unavailable' });
-                      return;
-                    }
-                  }
-
-                  if (cfg.vpnFilterMode !== 'off' && sess.meta.vpn === true) {
-                    if (cfg.vpnFilterMode === 'reject') {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'VPN_BLOCKED', msg: 'vpn traffic rejected' });
-                      return;
-                    }
-                  }
-                  if (cfg.asnBlockMode !== 'off' && typeof sess.meta.asn === 'number' && cfg.asnBlocklist.includes(sess.meta.asn)) {
-                    if (cfg.asnBlockMode === 'reject') {
-                      sess.sendDc({ t: 'ERR', v: 1, code: 'ASN_BLOCKED', msg: 'asn blocked' });
-                      return;
-                    }
-                  }
-
-                  // Optional clearlist enforcement.
-                  if (cfg.clearlistEnforce) {
-                    const vis: any = order?.body?.visibility;
-                    const kind = vis?.kind;
-                    const groupId = vis?.groupId;
-                    if ((kind === 'CLEARLIST' || kind === 'DARK') && typeof groupId === 'string' && groupId) {
-                      // CLEARLIST_ENFORCE=1 always comes with CLEARLIST_URL (config.ts), so the oracle is set.
-                      try {
-                        const res = await clearlist!.check(groupId, order.traderPubKey);
-                        if (!res.allowed) {
-                          sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_CLEARLISTED', msg: 'not clearlisted' });
-                          return;
-                        }
-                      } catch (e: any) {
-                        if (cfg.clearlistFailMode === 'closed') {
-                          logInternalError('clearlist-down', e);
-                          sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: 'clearlist unavailable' });
-                          return;
-                        }
-                      }
-                    }
                   }
 
                   // Atomic duplicate check: the awaits above (IP intel, clearlist) mean
