@@ -4,7 +4,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { computeEnvelopeHash, computeOrderId, envelopeSignedFields, stableStringify } from '../dist/canonical.js';
@@ -14,8 +13,6 @@ import { loadValidators } from '../dist/schema.js';
 
 const vectorsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'spec', 'test-vectors.json');
 const vectors = JSON.parse(fs.readFileSync(vectorsPath, 'utf8'));
-// The standalone scripts' serializer must agree with the spec as well.
-const scriptCanon = createRequire(import.meta.url)('../scripts/lib/tl-canon.cjs');
 
 // Independent re-implementation of the TL-Canon v1 convention used by the
 // smoke clients (scripts/smoke-live-flow.cjs buildOrder): code-point key order,
@@ -198,16 +195,13 @@ test('TL-Canon: every rejectTests input is refused, never serialized', () => {
   }
 });
 
-test('TL-Canon: scripts/lib/tl-canon.cjs matches every serialization vector and rejects the same inputs', () => {
-  assert.equal(scriptCanon.stableStringify(vectors.integerKeyTest.input), vectors.integerKeyTest.expectedCanonical);
-  assert.equal(scriptCanon.stableStringify(vectors.unicodeKeyOrderTest.input), vectors.unicodeKeyOrderTest.expectedCanonical);
-  assert.equal(scriptCanon.stableStringify(vectors.integralNumberTest.input), vectors.integralNumberTest.expectedCanonical);
-  assert.equal(
-    sha256Hex(scriptCanon.stableStringify(vectors.orderIntegerKeyTest.envelopeNoSig)),
-    vectors.orderIntegerKeyTest.expectedOrderId,
-  );
-  for (const c of vectors.rejectTests) {
-    assert.throws(() => scriptCanon.stableStringify(c.input), TypeError, c.name);
+test('TL-Canon round trip: the canonical text parses back to the same value and re-encodes byte-identically', () => {
+  for (const v of [vectors.integerKeyTest.input, vectors.unicodeKeyOrderTest.input, vectors.integralNumberTest.input, vectors.orderIntegerKeyTest.envelopeNoSig]) {
+    const text = stableStringify(v);
+    const back = JSON.parse(text);
+    assert.equal(stableStringify(back), text);
+    assert.deepStrictEqual(back, JSON.parse(JSON.stringify(v)));
+    assert.equal(sha256Hex(stableStringify(back)), sha256Hex(text));
   }
 });
 

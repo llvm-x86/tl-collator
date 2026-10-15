@@ -4,7 +4,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const ecc = require('tiny-secp256k1');
-const { stableStringify } = require('./lib/tl-canon.cjs');
+// TL-Canon comes from the collator's own build (src/canonical.ts), so the scripts and the
+// collator cannot disagree. Run `npm run build` first; dist/ is loaded on first use.
+let stableStringify;
 
 function usage() {
   console.log(
@@ -178,9 +180,12 @@ function main() {
   console.log(JSON.stringify({ ok: true, out: outPath, entry }, null, 2));
 }
 
-try {
-  main();
-} catch (e) {
-  console.error(String(e && e.message ? e.message : e));
-  process.exit(1);
-}
+(async () => {
+  try {
+    ({ stableStringify } = await import('../dist/canonical.js'));
+    main();
+  } catch (e) {
+    console.error(String(e && e.message ? e.message : e));
+    process.exit(1);
+  }
+})();

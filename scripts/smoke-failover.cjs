@@ -5,7 +5,10 @@ const crypto = require('node:crypto');
 const ecc = require('tiny-secp256k1');
 const wrtc = require('wrtc');
 const WS = require('ws');
-const { stableStringify } = require('./lib/tl-canon.cjs');
+
+// TL-Canon comes from the collator's own build (src/canonical.ts), so the scripts and the
+// collator cannot disagree. Run `npm run build` first; dist/ is loaded on first use.
+let stableStringify;
 
 global.RTCPeerConnection = wrtc.RTCPeerConnection;
 
@@ -243,6 +246,7 @@ async function runOnce(cfg) {
 }
 
 async function main() {
+  ({ stableStringify } = await import('../dist/canonical.js'));
   const args = parseArgs(process.argv);
   const cfg = {
     portA: Number(args['port-a'] || 8787),
