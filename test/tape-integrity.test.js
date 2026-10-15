@@ -135,7 +135,7 @@ test('N5: a failed append leaves no partial line; the next append continues the 
   assert.equal(restarted.append(order(3)), null, 'and is not accepted a second time');
 });
 
-test('N5: if the partial write cannot be cut back, the store refuses further appends', () => {
+test('N5: if the partial write cannot be cut back, appends are refused until the cut-back succeeds', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-partial-stuck-'));
   const t = openTape(dir);
   assert.ok(t.append(order(1)));
@@ -144,12 +144,17 @@ test('N5: if the partial write cannot be cut back, the store refuses further app
   fs.truncateSync = () => { throw new Error('EIO'); };
   try {
     assert.throws(() => t.append(order(2)), /ENOSPC/);
+    assert.throws(() => t.append(order(3)), /refusing appends until a failed write is cut back/);
   } finally {
     restore();
     fs.truncateSync = realTruncate;
   }
-  assert.throws(() => t.append(order(3)), /unrepaired write failure/);
-  assert.equal(t.hasOrder(order(3).orderId), false);
+  // The disk recovered: the next append cuts the partial line off first, so the chain continues at seq 2.
+  assert.equal(t.append(order(3)).seq, 2);
+  const reopened = openTape(dir);
+  assert.equal(reopened.getLastSeq(), 2);
+  assert.equal(reopened.hasOrder(order(2).orderId), false);
+  assert.equal(reopened.hasOrder(order(3).orderId), true);
 });
 
 test('N5: a torn last line from a crash is cut off on load, not glued onto by the next append', () => {

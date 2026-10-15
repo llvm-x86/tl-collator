@@ -146,9 +146,9 @@ export class TapeStore {
   // writes nothing) when the orderId is already on the tape.
   // A failed write is cut back to the pre-append length, so the file always
   // ends on a line boundary and in-memory state (seq, hash, index) matches disk.
-  // If that cut fails too, the store refuses further appends until restart.
+  // If that cut fails too, every append retries it first and is refused while it fails.
   append(order: OrderEnvelopeV1): TapeEntryV1 | null {
-    if (this.writeFailed) throw new Error('tape: refusing appends after an unrepaired write failure');
+    if (this.writeFailed) this.repairAfterWriteFailure();
     if (this.hasOrder(order.orderId)) return null;
     const seq = this.lastSeq + 1;
     const prevHash = this.lastHash;
@@ -188,6 +188,15 @@ export class TapeStore {
       this.idx.tapeSize = this.tapeBytes;
     }
     return entry;
+  }
+
+  private repairAfterWriteFailure(): void {
+    try {
+      fs.truncateSync(this.tapePath, this.tapeBytes);
+    } catch {
+      throw new Error('tape: refusing appends until a failed write is cut back');
+    }
+    this.writeFailed = false;
   }
 
   private cutBackTo(offset: number): void {
