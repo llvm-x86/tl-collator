@@ -286,6 +286,12 @@ async function main() {
     refillPerSec: cfg.httpRpcPerIpRps,
     maxKeys: HTTP_BUCKET_TABLE_MAX,
   });
+  // SUBMIT budget per client key, charged alongside each session's own bucket.
+  const submitClientBuckets = new KeyedTokenBuckets({
+    capacity: cfg.submitClientBurst,
+    refillPerSec: cfg.submitClientRatePerSec,
+    maxKeys: HTTP_BUCKET_TABLE_MAX,
+  });
   // Optional all-clients backstop, charged only after the per-client bucket admits.
   const httpRpcGlobal = cfg.httpRpcGlobalRps > 0
     ? new TokenBucket({ capacity: cfg.httpRpcGlobalBurst, refillPerSec: cfg.httpRpcGlobalRps })
@@ -1437,7 +1443,7 @@ async function main() {
                 }
 
                 if (wm.t === 'SUBMIT') {
-                  if (!sess.submitBucket.allow(1)) {
+                  if (!sess.admitSubmit(submitClientBuckets, ipKey)) {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'too many SUBMIT' });
                     return;
                   }

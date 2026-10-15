@@ -23,6 +23,8 @@ export interface Config {
   maxMsgBytes: number;
   submitBurst: number;
   submitRatePerSec: number;
+  submitClientBurst: number;
+  submitClientRatePerSec: number;
   clearlistEnforce: boolean;
   clearlistUrl: string | null;
   clearlistFailMode: 'open' | 'closed';
@@ -168,6 +170,9 @@ export function loadConfig(): Config {
   // Support both new and old env var names.
   const submitBurst = intEnv('SUBMIT_BURST', 10, atLeast(1));
   const submitRatePerSec = intEnv('SUBMIT_RPS', intEnv('SUBMIT_RATE_PER_SEC', 2, atLeast(1)), atLeast(1));
+  // Per client key (see clientIp.ts), shared by all of that client's sessions.
+  const submitClientBurst = intEnv('SUBMIT_CLIENT_BURST', 40, atLeast(1));
+  const submitClientRatePerSec = intEnv('SUBMIT_CLIENT_RPS', 8, atLeast(1));
 
   // H3b: sane default connection cap; CONN_MAX=0 explicitly disables the cap.
   const connMaxConfigured = intEnv('CONN_MAX', 256, atLeast(0));
@@ -214,6 +219,8 @@ export function loadConfig(): Config {
     maxMsgBytes: intEnv('MAX_MSG_BYTES', 1048576, atLeast(1)),
     submitBurst,
     submitRatePerSec,
+    submitClientBurst,
+    submitClientRatePerSec,
     clearlistEnforce,
     clearlistUrl,
     clearlistFailMode,

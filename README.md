@@ -112,6 +112,7 @@ Integer variables must be plain decimal integers (optional sign and surrounding 
 - `COLLATOR_KEY_PATH` (default: `./data/collator.key`)
 - `MAX_MSG_BYTES` (default: `1048576`)
 - `SUBMIT_BURST` (default: `10`) and `SUBMIT_RPS` (default: `2`) (also accepts legacy `SUBMIT_RATE_PER_SEC`)
+- `SUBMIT_CLIENT_BURST` (default: `40`) and `SUBMIT_CLIENT_RPS` (default: `8`): the SUBMIT budget of one client (limiter key, see below), shared by all of that client's sessions. Each SUBMIT is charged to its session and to its client, so opening more sessions does not raise a client's rate.
 - `TAPE_RESYNC_MAX_ENTRIES` (default: `10000`): a `TAPE_SUB` resync replays at most this many of the newest tape entries. The `TAPE_END` reply carries `fromSeq`, the first seq actually replayed; when it is greater than the requested `fromSeq` the earlier history was not sent and must be fetched another way.
 - `NAME`, `OPERATOR`, `REGION` (optional manifest fields)
 - `CONN_MAX` (hard cap on concurrent WS connections, default `256`; set `0` to disable the cap)

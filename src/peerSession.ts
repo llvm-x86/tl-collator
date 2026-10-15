@@ -1,6 +1,6 @@
 import type { WebSocket } from 'ws';
 import type { TapeEntryV1, WireMsg } from './types.js';
-import { TokenBucket } from './ratelimit.js';
+import { TokenBucket, type KeyedTokenBuckets } from './ratelimit.js';
 
 export interface SessionMetaV1 {
   remoteIp?: string;
@@ -56,6 +56,14 @@ export class PeerSession {
       firstSeenTs: now,
       lastSeenTs: now,
     };
+  }
+
+  /**
+   * Charges one SUBMIT to this session and to its client key. The session bucket alone would let one
+   * client multiply its rate by the number of sessions it can open (CONN_MAX_PER_IP).
+   */
+  admitSubmit(clients: KeyedTokenBuckets, clientKey: string): boolean {
+    return this.submitBucket.allow(1) && clients.take(clientKey).allowed;
   }
 
   /**

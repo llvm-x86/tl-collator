@@ -14,6 +14,8 @@ import { ClearlistClient } from '../dist/clearlist.js';
 import { computeEnvelopeHash } from '../dist/canonical.js';
 import { pubKeyFromPrivKeyHex, signWithPrivKeyHex } from '../dist/crypto.js';
 import { TapeStore } from '../dist/tape.js';
+import { PeerSession } from '../dist/peerSession.js';
+import { KeyedTokenBuckets } from '../dist/ratelimit.js';
 
 const TRADER_A = '11'.repeat(32);
 const TRADER_B = '22'.repeat(32);
@@ -359,4 +361,17 @@ test('admission: a trader key or order reference in upper-case hex names the sam
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------- SUBMIT rate
+
+test('submit: sessions of one client share one SUBMIT budget; another client is not affected', () => {
+  const clients = new KeyedTokenBuckets({ capacity: 2, refillPerSec: 0.001, maxKeys: 100 });
+  const session = (id) => new PeerSession({ id, ws: {}, burst: 100, ratePerSec: 100, remoteIp: '198.51.100.7' });
+  const a = session('a');
+  const b = session('b');
+  assert.equal(a.admitSubmit(clients, 'ip:198.51.100.7'), true);
+  assert.equal(a.admitSubmit(clients, 'ip:198.51.100.7'), true);
+  assert.equal(b.admitSubmit(clients, 'ip:198.51.100.7'), false, 'a second session multiplied the client budget');
+  assert.equal(b.admitSubmit(clients, 'ip:203.0.113.9'), true);
 });

@@ -203,3 +203,13 @@ test('config: CLEARLIST_ENFORCE=1 requires CLEARLIST_URL, so enforcement can not
     assert.equal(cfg.clearlistFailMode, 'closed');
   });
 });
+
+test('config: the per-client SUBMIT budget is parsed strictly and defaults to 40 burst, 8 per second', () => {
+  withEnv({}, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.submitClientBurst, 40);
+    assert.equal(cfg.submitClientRatePerSec, 8);
+  });
+  withEnv({ SUBMIT_CLIENT_RPS: '0' }, () => assert.throws(() => loadConfig(), /SUBMIT_CLIENT_RPS must be an integer/));
+  withEnv({ SUBMIT_CLIENT_BURST: 'many' }, () => assert.throws(() => loadConfig(), /SUBMIT_CLIENT_BURST must be an integer/));
+});
