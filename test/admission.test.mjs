@@ -342,3 +342,21 @@ test('clearlist: the verdict cache is bounded; the least recently used key is re
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('admission: a trader key or order reference in upper-case hex names the same trader and order', async () => {
+  const { tape, dir } = openTape();
+  try {
+    const sources = { tape, intel: null, clearlist: clearlistStub({ allowed: true }) };
+    const upperKey = pubKeyFromPrivKeyHex(TRADER_A).toUpperCase();
+    const owned = signed({ traderPubKey: upperKey });
+    assert.ok(tape.append(owned));
+    const cancel = signed({ kind: 'CANCEL', cancelsOrderId: owned.orderId.toUpperCase() });
+    assert.equal(await admitOrder(NO_POLICY, sources, meta(), cancel), null, 'an honest cancel was refused');
+    const gated = { ...NO_POLICY, clearlistEnforce: true };
+    const groupOrder = signed({ traderPubKey: upperKey, body: { v: 1, market: 'SPOT:LTC/TL', side: 'BUY', px: '1', qty: '1', visibility: { kind: 'CLEARLIST', groupId: 'g1' }, clientTs: 2 } });
+    await admitOrder(gated, sources, meta(), groupOrder);
+    assert.deepEqual(sources.clearlist.calls, [['g1', upperKey.toLowerCase()]], 'the clearlist was asked about a differently spelled key');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -66,13 +66,13 @@ export async function admitOrder(
     if (!target) return refuse('SCHEMA_INVALID', 'missing cancelsOrderId');
     const owner = src.tape.getTraderForOrderId(target);
     if (!owner) return refuse('UNKNOWN_ORDER', 'cancelsOrderId not found');
-    if (owner !== order.traderPubKey) return refuse('NOT_OWNER', 'cannot cancel other trader order');
+    if (owner !== order.traderPubKey.toLowerCase()) return refuse('NOT_OWNER', 'cannot cancel other trader order');
   } else if (order.kind === 'REPLACE') {
     const target = String(order.replacesOrderId || '').trim();
     if (!target) return refuse('SCHEMA_INVALID', 'missing replacesOrderId');
     const owner = src.tape.getTraderForOrderId(target);
     if (!owner) return refuse('UNKNOWN_ORDER', 'replacesOrderId not found');
-    if (owner !== order.traderPubKey) return refuse('NOT_OWNER', 'cannot replace other trader order');
+    if (owner !== order.traderPubKey.toLowerCase()) return refuse('NOT_OWNER', 'cannot replace other trader order');
   }
 
   // IP intel policy. A reject mode admits only on a usable answer (intelAdmits): a failed lookup, no
@@ -109,7 +109,7 @@ export async function admitOrder(
     if ((kind === 'CLEARLIST' || kind === 'DARK') && typeof groupId === 'string' && groupId) {
       if (!src.clearlist) return refuse('CLEARLIST_DOWN', 'clearlist unavailable');
       try {
-        const res = await src.clearlist.check(groupId, order.traderPubKey);
+        const res = await src.clearlist.check(groupId, order.traderPubKey.toLowerCase());
         if (!res.allowed) return refuse('NOT_CLEARLISTED', 'not clearlisted');
       } catch (e: any) {
         if (policy.clearlistFailMode === 'closed') {

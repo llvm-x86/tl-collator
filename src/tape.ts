@@ -87,7 +87,7 @@ export class TapeStore {
       const oid = (e as any)?.order?.orderId;
       const pk = (e as any)?.order?.traderPubKey;
       if (typeof oid === 'string' && typeof pk === 'string') {
-        this.traderByOrderId.set(oid, pk);
+        this.traderByOrderId.set(oid.toLowerCase(), pk.toLowerCase());
       }
     });
   }
@@ -115,15 +115,17 @@ export class TapeStore {
     return this.lastHash;
   }
 
+  // Ids and trader keys are hex. Their case is not part of their identity, so every key is stored
+  // and looked up in lower case.
   getTraderForOrderId(orderId: string): string | null {
-    return this.traderByOrderId.get(orderId) || null;
+    return this.traderByOrderId.get(orderId.toLowerCase()) || null;
   }
 
   // Covers every entry on disk (loaded at startup) and every append since, so
   // an orderId can never be recorded twice — including after a restart, when
   // a harvested SUBMIT would otherwise be re-accepted.
   hasOrder(orderId: string): boolean {
-    return this.traderByOrderId.has(orderId);
+    return this.traderByOrderId.has(orderId.toLowerCase());
   }
 
   computeEntryHash(base: Omit<TapeEntryV1, 'entryHash' | 'sigCollator'>): string {
@@ -147,7 +149,7 @@ export class TapeStore {
   // If that cut fails too, the store refuses further appends until restart.
   append(order: OrderEnvelopeV1): TapeEntryV1 | null {
     if (this.writeFailed) throw new Error('tape: refusing appends after an unrepaired write failure');
-    if (this.traderByOrderId.has(order.orderId)) return null;
+    if (this.hasOrder(order.orderId)) return null;
     const seq = this.lastSeq + 1;
     const prevHash = this.lastHash;
     const receivedTs = Date.now();
@@ -178,7 +180,7 @@ export class TapeStore {
 
     this.lastSeq = seq;
     this.lastHash = entryHash;
-    this.traderByOrderId.set(order.orderId, order.traderPubKey);
+    this.traderByOrderId.set(order.orderId.toLowerCase(), order.traderPubKey.toLowerCase());
 
     // Keep the seek index current: offsets[i] is the line for seq i*stride+1.
     if (this.idx) {
