@@ -10,6 +10,7 @@ import path from 'node:path';
 
 import { admitOrder } from '../dist/orderAdmission.js';
 import { IpIntelClient, intelAdmits } from '../dist/ipIntel.js';
+import { ClearlistClient } from '../dist/clearlist.js';
 import { computeEnvelopeHash } from '../dist/canonical.js';
 import { pubKeyFromPrivKeyHex, signWithPrivKeyHex } from '../dist/crypto.js';
 import { TapeStore } from '../dist/tape.js';
@@ -313,5 +314,31 @@ test('intel: a reject mode with no intel source refuses rather than admitting un
     assert.equal(await refusalOf(VPN_REJECT, { tape, intel: null, clearlist: null }, meta(), signed()), 'INTEL_UNAVAILABLE');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- clearlist cache
+
+test('clearlist: the verdict cache is bounded; the least recently used key is re-asked', async () => {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ allowed: true }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const client = new ClearlistClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, max: 2 });
+  try {
+    await client.check('g', 'aa');
+    await client.check('g', 'bb');
+    await client.check('g', 'cc');
+    assert.equal(hits, 3);
+    await client.check('g', 'cc');
+    assert.equal(hits, 3, 'a recent key was served from the cache');
+    await client.check('g', 'aa');
+    assert.equal(hits, 4, 'the evicted key was not re-asked: the cache grew past its bound');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
   }
 });

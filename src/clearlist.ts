@@ -1,10 +1,11 @@
 import { fetchBoundedJson } from './boundedFetch.js';
-
-type CacheKey = string;
+import { LruMap } from './lru.js';
 
 // Round 8: a stalled or oversized clearlist answer must not hold a SUBMIT open or buffer without limit.
 const CLEARLIST_TIMEOUT_MS = 3000;
 const CLEARLIST_MAX_BYTES = 64 * 1024;
+// Keys are (group, trader key) pairs a SUBMIT chooses, so the cache is bounded like the intel cache.
+const CLEARLIST_CACHE_MAX = 5000;
 
 export interface ClearlistResult {
   allowed: boolean;
@@ -15,19 +16,17 @@ export interface ClearlistResult {
 export class ClearlistClient {
   private baseUrl: string;
   private ttlMs: number;
-  private cache = new Map<CacheKey, { exp: number; v: ClearlistResult }>();
+  private cache: LruMap<{ exp: number; v: ClearlistResult }>;
 
-  constructor(opts: { baseUrl: string; ttlMs?: number }) {
+  constructor(opts: { baseUrl: string; ttlMs?: number; max?: number }) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
     this.ttlMs = Math.max(1000, opts.ttlMs || 60000);
-  }
-
-  private key(groupId: string, pubkeyHex: string): CacheKey {
-    return `${groupId}|${pubkeyHex}`;
+    this.cache = new LruMap(opts.max ?? CLEARLIST_CACHE_MAX);
   }
 
   async check(groupId: string, pubkeyHex: string): Promise<ClearlistResult> {
-    const k = this.key(groupId, pubkeyHex);
+    // pubkeyHex is hex, so no '|' can occur in it and the key is unambiguous.
+    const k = `${groupId}|${pubkeyHex}`;
     const now = Date.now();
     const hit = this.cache.get(k);
     if (hit && hit.exp > now) return hit.v;
