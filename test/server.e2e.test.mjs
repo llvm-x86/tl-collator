@@ -411,3 +411,26 @@ test('routes: a call outside the public mesh allowlist gets the same fixed 403 o
     await c.stop();
   }
 });
+
+test('signal: SIGNAL_OFFER is paced per session; a flood is answered rate_limited and does not disturb the peer', { timeout: 60000 }, async () => {
+  const c = await startCollator({});
+  const ws = new WebSocket(`ws://127.0.0.1:${c.port}/ws`);
+  const replies = [];
+  ws.on('message', (d) => replies.push(JSON.parse(d.toString())));
+  try {
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    for (let i = 0; i < 10; i++) {
+      ws.send(JSON.stringify({ t: 'SIGNAL_OFFER', v: 1, kind: 'offer', sdp: 'v=0' }));
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+    const limited = replies.filter((m) => m.t === 'SIGNAL_ERR' && m.code === 'rate_limited').length;
+    assert.equal(replies.length, 10, 'every offer is answered');
+    assert.ok(limited >= 5, `only ${limited} of 10 offers were paced`);
+  } finally {
+    ws.close();
+    await c.stop();
+  }
+});

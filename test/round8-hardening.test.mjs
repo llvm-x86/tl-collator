@@ -302,3 +302,10 @@ test('R8-HTTP deadlines: stalled headers, stalled bodies and an idle WebSocket',
     await c.stop();
   }
 });
+
+test('R8-DC the inbound size is measured in bytes, the unit MAX_MSG_BYTES and the WebSocket cap use', () => {
+  // 'é' is two bytes in UTF-8 but one UTF-16 unit: a string cap counted in units admits twice the bytes.
+  assert.equal(peerSession.dcMessageBytes('é'.repeat(10)), 20);
+  assert.equal(peerSession.dcMessageBytes(new Uint8Array(7)), 7);
+  assert.equal(peerSession.dcMessageBytes(new ArrayBuffer(5)), 5);
+});

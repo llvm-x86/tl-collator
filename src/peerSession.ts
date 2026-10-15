@@ -27,6 +27,14 @@ export const DC_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
  */
 export const DC_REPLAY_HIGH_WATER_BYTES = 1024 * 1024;
 
+/**
+ * Size in bytes of one inbound DataChannel message. MAX_MSG_BYTES is a byte limit (the WebSocket
+ * side is enforced in bytes by ws), so the DataChannel side must count bytes too, not string units.
+ */
+export function dcMessageBytes(data: string | ArrayBuffer | ArrayBufferView): number {
+  return typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
+}
+
 /** A replay gives up on a channel whose queue has not shrunk for this long (a stalled peer). */
 export const DC_REPLAY_STALL_MS = 10_000;
 
@@ -42,6 +50,10 @@ export class PeerSession {
 
   // SUBMIT rate limit (per-peer).
   submitBucket: TokenBucket;
+
+  // SIGNAL_OFFER pacing. Each accepted offer builds a native peer connection, and one connection
+  // needs one offer, so a small burst covers reconnects and the rest is refused.
+  offerBucket: TokenBucket = new TokenBucket({ capacity: 3, refillPerSec: 1 });
 
   meta: SessionMetaV1;
 

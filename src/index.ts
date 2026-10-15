@@ -11,7 +11,7 @@ import { loadConfig } from './config.js';
 import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg, WireMsg } from './types.js';
 import { ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
 import { TapeStore } from './tape.js';
-import { PeerSession, broadcastTapeEntry } from './peerSession.js';
+import { PeerSession, broadcastTapeEntry, dcMessageBytes } from './peerSession.js';
 import { fetchBoundedJson } from './boundedFetch.js';
 import { attachRequestDeadlines } from './httpDeadlines.js';
 import { isWireMsg } from './validate.js';
@@ -1281,6 +1281,11 @@ async function main() {
         }
 
         if (msg.t === 'SIGNAL_OFFER') {
+          // Refused before anything is torn down, so a flood cannot close the live channel.
+          if (!sess.offerBucket.allow(1)) {
+            sendSignal({ t: 'SIGNAL_ERR', v: 1, code: 'rate_limited', msg: 'too many SIGNAL_OFFER' });
+            return;
+          }
           // Collator is the answerer.
           // H3a: close/replace any previous peer connection for this session;
           // otherwise a client looping offers leaks native WebRTC/ICE resources.
@@ -1316,12 +1321,12 @@ async function main() {
 
             dc.onmessage = async (ev2: any) => {
               try {
-                const txt = typeof ev2.data === 'string' ? ev2.data : Buffer.from(ev2.data).toString('utf8');
-                if (txt.length > cfg.maxMsgBytes) {
+                if (dcMessageBytes(ev2.data) > cfg.maxMsgBytes) {
                   sess.sendDc({ t: 'ERR', v: 1, code: 'msg_too_large', msg: 'message too large' });
                   try { dc.close(); } catch {}
                   return;
                 }
+                const txt = typeof ev2.data === 'string' ? ev2.data : Buffer.from(ev2.data).toString('utf8');
                 const wm = safeJsonParse(txt) as WireMsg | null;
                 if (!wm || !isWireMsg(wm)) return;
                 sess.meta.lastSeenTs = Date.now();
