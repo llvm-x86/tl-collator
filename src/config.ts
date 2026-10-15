@@ -96,6 +96,19 @@ export function intEnv(k: string, d: number, bounds: IntBounds): number {
   return parseIntEnv(k, process.env[k], d, bounds);
 }
 
+// The single parser for enumerated policy switches. Unset or empty means the
+// default; any other value must be one of `choices` (case-insensitive). A
+// misspelled mode such as `rejct` must not read as `off`.
+export function parseChoiceEnv<T extends string>(k: string, raw: string | undefined, d: T, choices: readonly T[]): T {
+  const v = (raw ?? '').trim().toLowerCase();
+  if (v === '') return d;
+  const hit = choices.find((c) => c === v);
+  if (hit === undefined) {
+    throw new Error(`${k} must be one of ${choices.join(', ')} (got "${raw}")`);
+  }
+  return hit;
+}
+
 export function loadConfig(): Config {
   const dataDir = process.env.DATA_DIR || './data';
   const tapePath = process.env.TAPE_PATH || path.join(dataDir, 'tape.log');
@@ -115,31 +128,32 @@ export function loadConfig(): Config {
 
   fs.mkdirSync(dataDir, { recursive: true });
 
-  const clearlistEnforce = String(process.env.CLEARLIST_ENFORCE || '') === '1';
+  const clearlistEnforce = parseChoiceEnv('CLEARLIST_ENFORCE', process.env.CLEARLIST_ENFORCE, '0', ['0', '1']) === '1';
   const clearlistUrl = process.env.CLEARLIST_URL || null;
-  const clearlistFailMode = (process.env.CLEARLIST_FAIL_MODE === 'open' ? 'open' : 'closed') as 'open' | 'closed';
+  if (clearlistEnforce && !clearlistUrl) {
+    throw new Error('CLEARLIST_ENFORCE=1 requires CLEARLIST_URL (the clearlist oracle)');
+  }
+  const clearlistFailMode = parseChoiceEnv('CLEARLIST_FAIL_MODE', process.env.CLEARLIST_FAIL_MODE, 'closed', ['open', 'closed']);
 
   const name = process.env.NAME || null;
   const operator = process.env.OPERATOR || null;
   const region = process.env.REGION || null;
 
-  const ipLogging = (String(process.env.IP_LOGGING || '') === 'on' || String(process.env.IP_LOGGING || '') === '1')
-    ? 'on'
-    : 'off';
+  const ipLoggingSwitch = parseChoiceEnv('IP_LOGGING', process.env.IP_LOGGING, 'off', ['off', 'on', '0', '1']);
+  const ipLogging = ipLoggingSwitch === 'on' || ipLoggingSwitch === '1' ? 'on' : 'off';
 
   const ipIntelUrl = process.env.IP_INTEL_URL || null;
   const ipIntelTtlSec = intEnv('IP_INTEL_TTL_SEC', 300, atLeast(0));
 
-  // If no IP intel configured, be honest: disable vpn/asn enforcement modes.
-  const rawVpnMode = (process.env.VPN_FILTER_MODE || 'off').toLowerCase();
-  const vpnFilterMode = (ipIntelUrl
-    ? (rawVpnMode === 'reject' ? 'reject' : rawVpnMode === 'log' ? 'log' : 'off')
-    : 'off') as 'off' | 'log' | 'reject';
-
-  const rawAsnMode = (process.env.ASN_BLOCK_MODE || 'off').toLowerCase();
-  const asnBlockMode = (ipIntelUrl
-    ? (rawAsnMode === 'reject' ? 'reject' : rawAsnMode === 'log' ? 'log' : 'off')
-    : 'off') as 'off' | 'log' | 'reject';
+  // A verdict-driven mode needs the intel source it reads from. Refusing the
+  // combination keeps a configured block from being silently inert.
+  const intelModes = ['off', 'log', 'reject'] as const;
+  const vpnFilterMode = parseChoiceEnv('VPN_FILTER_MODE', process.env.VPN_FILTER_MODE, 'off', intelModes);
+  const asnBlockMode = parseChoiceEnv('ASN_BLOCK_MODE', process.env.ASN_BLOCK_MODE, 'off', intelModes);
+  if (!ipIntelUrl) {
+    if (vpnFilterMode !== 'off') throw new Error(`VPN_FILTER_MODE=${vpnFilterMode} requires IP_INTEL_URL`);
+    if (asnBlockMode !== 'off') throw new Error(`ASN_BLOCK_MODE=${asnBlockMode} requires IP_INTEL_URL`);
+  }
 
   // Comma-separated ASNs; empty entries are skipped, anything else must be a positive integer.
   const asnBlocklist = String(process.env.ASN_BLOCKLIST || '')
@@ -147,6 +161,9 @@ export function loadConfig(): Config {
     .map((s) => s.trim())
     .filter((s) => s !== '')
     .map((s) => parseIntEnv('ASN_BLOCKLIST', s, 0, atLeast(1, 4294967295)));
+  if (asnBlocklist.length > 0 && asnBlockMode === 'off') {
+    throw new Error('ASN_BLOCKLIST is set but ASN_BLOCK_MODE is off; set ASN_BLOCK_MODE=log or reject, or unset ASN_BLOCKLIST');
+  }
 
   // Support both new and old env var names.
   const submitBurst = intEnv('SUBMIT_BURST', 10, atLeast(1));

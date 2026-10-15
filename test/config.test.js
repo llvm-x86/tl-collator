@@ -47,14 +47,20 @@ test('config: every integer env var is parsed strictly, including the ones read 
     ['BITVM_COLLATERAL_PROPERTY_ID', 'one'],
     ['ASN_BLOCKLIST', '64496,AS65000'],
   ]) {
-    withEnv({ [k]: v }, () => {
+    withEnv({ IP_INTEL_URL: 'http://127.0.0.1:9/intel', ASN_BLOCK_MODE: 'log', [k]: v }, () => {
       assert.throws(() => loadConfig(), new RegExp(`${k} must be an integer`), `${k}=${v} must abort`);
     });
   }
 });
 
 test('config: unset, empty and explicit values for the converted integer env vars', () => {
-  withEnv({ PENDING_RPC_MAX: '', CONN_IDLE_TIMEOUT_MS: '', ASN_BLOCKLIST: ' 64496 , ,65000 ' }, () => {
+  withEnv({
+    PENDING_RPC_MAX: '',
+    CONN_IDLE_TIMEOUT_MS: '',
+    IP_INTEL_URL: 'http://127.0.0.1:9/intel',
+    ASN_BLOCK_MODE: 'log',
+    ASN_BLOCKLIST: ' 64496 , ,65000 ',
+  }, () => {
     const cfg = loadConfig();
     assert.equal(cfg.pendingRpcMax, 1000);
     assert.equal(cfg.connIdleTimeoutMs, 60000);
@@ -153,4 +159,47 @@ test('config: the global HTTP budget is off by default and parsed strictly', () 
   });
   withEnv({ HTTP_RPC_GLOBAL_RPS: '-1' }, () => assert.throws(() => loadConfig(), /HTTP_RPC_GLOBAL_RPS must be an integer/));
   withEnv({ HTTP_RPC_GLOBAL_BURST: '0' }, () => assert.throws(() => loadConfig(), /HTTP_RPC_GLOBAL_BURST must be an integer/));
+});
+
+test('config: the policy switches are spelled exactly; a misspelled one aborts startup instead of meaning off', () => {
+  withEnv({ CLEARLIST_ENFORCE: 'true', CLEARLIST_URL: 'https://clearlist.example' }, () => {
+    assert.throws(() => loadConfig(), /CLEARLIST_ENFORCE must be one of 0, 1/);
+  });
+  withEnv({ CLEARLIST_FAIL_MODE: 'opn' }, () => assert.throws(() => loadConfig(), /CLEARLIST_FAIL_MODE must be one of open, closed/));
+  withEnv({ IP_LOGGING: 'yes' }, () => assert.throws(() => loadConfig(), /IP_LOGGING must be one of/));
+  withEnv({ VPN_FILTER_MODE: 'rejct', IP_INTEL_URL: 'http://127.0.0.1:9/intel' }, () => {
+    assert.throws(() => loadConfig(), /VPN_FILTER_MODE must be one of off, log, reject/);
+  });
+  withEnv({ ASN_BLOCK_MODE: 'block', IP_INTEL_URL: 'http://127.0.0.1:9/intel' }, () => {
+    assert.throws(() => loadConfig(), /ASN_BLOCK_MODE must be one of off, log, reject/);
+  });
+});
+
+test('config: a log or reject intel mode without IP_INTEL_URL aborts startup instead of silently turning off', () => {
+  withEnv({ VPN_FILTER_MODE: 'reject' }, () => assert.throws(() => loadConfig(), /VPN_FILTER_MODE=reject requires IP_INTEL_URL/));
+  withEnv({ ASN_BLOCK_MODE: 'log' }, () => assert.throws(() => loadConfig(), /ASN_BLOCK_MODE=log requires IP_INTEL_URL/));
+  withEnv({ ASN_BLOCKLIST: '64496' }, () => assert.throws(() => loadConfig(), /ASN_BLOCKLIST is set but ASN_BLOCK_MODE is off/));
+  withEnv({ VPN_FILTER_MODE: 'off', ASN_BLOCK_MODE: 'off' }, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.vpnFilterMode, 'off');
+    assert.equal(cfg.asnBlockMode, 'off');
+  });
+});
+
+test('config: intel reject modes are honoured when IP_INTEL_URL is set', () => {
+  withEnv({ IP_INTEL_URL: 'http://127.0.0.1:9/intel', VPN_FILTER_MODE: 'Reject', ASN_BLOCK_MODE: 'log', ASN_BLOCKLIST: '64496' }, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.vpnFilterMode, 'reject');
+    assert.equal(cfg.asnBlockMode, 'log');
+    assert.deepEqual(cfg.asnBlocklist, [64496]);
+  });
+});
+
+test('config: CLEARLIST_ENFORCE=1 requires CLEARLIST_URL, so enforcement can not be configured without an oracle', () => {
+  withEnv({ CLEARLIST_ENFORCE: '1' }, () => assert.throws(() => loadConfig(), /CLEARLIST_ENFORCE=1 requires CLEARLIST_URL/));
+  withEnv({ CLEARLIST_ENFORCE: '1', CLEARLIST_URL: 'https://clearlist.example' }, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.clearlistEnforce, true);
+    assert.equal(cfg.clearlistFailMode, 'closed');
+  });
 });

@@ -1544,22 +1544,18 @@ async function main() {
                     const kind = vis?.kind;
                     const groupId = vis?.groupId;
                     if ((kind === 'CLEARLIST' || kind === 'DARK') && typeof groupId === 'string' && groupId) {
-                      if (!clearlist) {
-                        sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_CONFIG', msg: 'CLEARLIST_URL not configured' });
-                        if (cfg.clearlistFailMode === 'closed') return;
-                      } else {
-                        try {
-                          const res = await clearlist.check(groupId, order.traderPubKey);
-                          if (!res.allowed) {
-                            sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_CLEARLISTED', msg: 'not clearlisted' });
-                            return;
-                          }
-                        } catch (e: any) {
-                          if (cfg.clearlistFailMode === 'closed') {
-                            logInternalError('clearlist-down', e);
-                            sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: 'clearlist unavailable' });
-                            return;
-                          }
+                      // CLEARLIST_ENFORCE=1 always comes with CLEARLIST_URL (config.ts), so the oracle is set.
+                      try {
+                        const res = await clearlist!.check(groupId, order.traderPubKey);
+                        if (!res.allowed) {
+                          sess.sendDc({ t: 'ERR', v: 1, code: 'NOT_CLEARLISTED', msg: 'not clearlisted' });
+                          return;
+                        }
+                      } catch (e: any) {
+                        if (cfg.clearlistFailMode === 'closed') {
+                          logInternalError('clearlist-down', e);
+                          sess.sendDc({ t: 'ERR', v: 1, code: 'CLEARLIST_DOWN', msg: 'clearlist unavailable' });
+                          return;
                         }
                       }
                     }
