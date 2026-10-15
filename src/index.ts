@@ -1136,10 +1136,15 @@ async function main() {
   //    established DataChannel sessions refuses new connections with 1013.
   const { connIdleTimeoutMs, connSweepIntervalMs, connHandshakeGraceMs } = cfg;
   const perIpCounts = new Map<string, number>();
+  // Each session's cleanup, so a session can leave the pool at once when it is evicted.
+  const teardowns = new Map<PeerSession, () => void>();
 
   const isSilentPeer = (p: PeerSession): boolean => !p.dc || p.dc.readyState !== 'open';
 
-  const closePeer = (p: PeerSession, code: number, reason: string): void => {
+  // The pool slot is released now, not when the close event arrives: a close frame takes a round trip,
+  // and until then a burst of handshakes would find the same full pool and displace the same victim.
+  const evictPeer = (p: PeerSession, code: number, reason: string): void => {
+    teardowns.get(p)?.();
     try {
       p.ws.close(code, reason);
     } catch {}
@@ -1155,7 +1160,7 @@ async function main() {
         ip: p.meta.remoteIp || null,
         idleMs: nowTs - p.meta.lastSeenTs,
       });
-      closePeer(p, 1013, 'idle connection reaped');
+      evictPeer(p, 1013, 'idle connection reaped');
       reaped++;
     }
     return reaped;
@@ -1202,7 +1207,7 @@ async function main() {
         victim: victim.id,
         victimIp: victim.meta.remoteIp || null,
       });
-      closePeer(victim, 1013, 'displaced by new handshake');
+      evictPeer(victim, 1013, 'displaced by new handshake');
     }
 
     const id = `peer-${randId()}`;
@@ -1222,6 +1227,7 @@ async function main() {
     const cleanup = async () => {
       // Single-run guard: 'error' is often followed by 'close'.
       if (!sessions.has(id)) return;
+      teardowns.delete(sess);
       try {
         sess.dc?.close();
       } catch {}
@@ -1250,6 +1256,7 @@ async function main() {
       }
     };
 
+    teardowns.set(sess, () => void cleanup());
     ws.on('close', () => void cleanup());
     ws.on('error', () => void cleanup());
 

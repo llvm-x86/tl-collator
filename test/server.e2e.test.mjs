@@ -371,3 +371,20 @@ test('N4: WebSocket connection cap is keyed on the resolved client IP, not the p
     await proxied.stop();
   }
 });
+
+test('N4: a handshake that displaces a silent session frees its slot at once; a burst cannot exceed CONN_MAX', { timeout: 120000 }, async () => {
+  const c = await startCollator({ CONN_MAX: '2', CONN_HANDSHAKE_GRACE_MS: '0' });
+  try {
+    const held = [openWs(c.port, '203.0.113.1'), openWs(c.port, '203.0.113.2')];
+    await Promise.all(held.map((s) => s.ready));
+    // All of these arrive before any displaced socket's close handshake completes.
+    const burst = [];
+    for (let i = 0; i < 6; i++) burst.push(openWs(c.port, `203.0.113.${10 + i}`));
+    await Promise.all(burst.map((s) => s.ready));
+    await new Promise((r) => setTimeout(r, 500));
+    const alive = [...held, ...burst].filter((s) => s.opened && s.closeCode === null).length;
+    assert.ok(alive <= 2, `${alive} sessions are open with CONN_MAX=2`);
+  } finally {
+    await c.stop();
+  }
+});
