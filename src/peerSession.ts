@@ -153,6 +153,7 @@ export class PeerSession {
       }
       if (!open || !this.replayIsCurrent(replay)) return;
       // Cleared and TAPE_END sent with no await in between: no live entry can slip in before the end marker.
+      // TAPE_END is optional for the wallet, which ignores it if it does not understand it.
       this.replay = null;
       // `fromSeq` is the first seq actually replayed: it is greater than the requested one when the
       // resync was clamped to TAPE_RESYNC_MAX_ENTRIES. The tip is read here, after every entry up to
