@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -281,4 +282,24 @@ test('R12-F4 a trusted hop broader than /8 (IPv4) or /16 (IPv6) is refused unles
   const req = { headers: { 'x-forwarded-for': '200.0.0.1' }, socket: { remoteAddress: '1.2.3.4' } };
   assert.equal(resolver.resolve(req), '200.0.0.1');
   assert.throws(() => trust('0.0.0.0/1', { TRUST_PROXY_ALLOW_BROAD_CIDRS: 'yes' }), /TRUST_PROXY_ALLOW_BROAD_CIDRS/);
+});
+
+// ------------------------------------------------------- client IP rule (F5)
+
+// Shared with tl-relayer (scripts/fixtures/client-ip-vectors.json): both repos read the same bytes.
+const CLIENT_IP_VECTORS_SHA256 = '38120ac55cdd3d7938fd09e680d1567a5a78fd95d433dc7ec511a528cda90020';
+
+test('R12-F5 the X-Forwarded-For client IP rule matches the shared vectors', async () => {
+  const bytes = fs.readFileSync(path.join(root, 'test', 'fixtures', 'client-ip-vectors.json'));
+  assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), CLIENT_IP_VECTORS_SHA256, 'vector file differs from the shared copy');
+  const { cases } = JSON.parse(bytes.toString('utf8'));
+  const { createClientIpResolver } = await import('../dist/clientIp.js');
+  const failures = [];
+  for (const c of cases) {
+    const resolver = createClientIpResolver({ enabled: true, cidrs: c.trusted });
+    const headers = c.xff === null ? {} : { 'x-forwarded-for': c.xff };
+    const got = resolver.resolve({ headers, socket: { remoteAddress: c.peer } });
+    if (got !== c.expect) failures.push(`${c.name}: got ${JSON.stringify(got)}, want ${JSON.stringify(c.expect)}`);
+  }
+  assert.deepEqual(failures, [], 'client IP rule disagrees with the shared vectors');
 });

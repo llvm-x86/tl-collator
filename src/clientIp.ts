@@ -89,6 +89,14 @@ export function clientKeyForIp(ip: string, ipv6PrefixLen: number): string {
   return `ip:${normalizeIp(masked.map((w) => w.toString(16)).join(':'))}/${ipv6PrefixLen}`;
 }
 
+// One X-Forwarded-For hop under the shared rule (vectors: test/fixtures/client-ip-vectors.json). Only a
+// bare IP literal is a hop: brackets, zone identifiers, ports and empty entries are malformed (round 12 / F5).
+function forwardedHop(raw: string): string | null {
+  const hop = raw.trim();
+  if (net.isIP(hop) === 0 || hop.includes('%')) return null;
+  return normalizeIp(hop) || null;
+}
+
 function parseCidr(entry: string): ParsedCidr {
   const m = /^(.+)\/(\d{1,3})$/.exec(entry);
   const addr = m ? m[1] : entry;
@@ -176,11 +184,13 @@ export function createClientIpResolver(cfg: TrustedProxyConfig): ClientIpResolve
       // Single-valued headers (cf-connecting-ip, x-real-ip) are deliberately
       // ignored: a proxy that does not overwrite them passes a client-chosen
       // value straight through. Malformed entries fail closed to the peer.
-      const xff = header(req, 'x-forwarded-for').split(',').map((s) => s.trim()).filter(Boolean);
-      for (let i = xff.length - 1; i >= 0; i--) {
-        const ip = normalizeIp(xff[i]);
-        if (!ip) return peer;
-        if (!isTrustedHop(ip)) return ip;
+      const xff = header(req, 'x-forwarded-for');
+      if (xff.trim() === '') return peer;
+      const hops = xff.split(',').map(forwardedHop);
+      if (hops.some((hop) => hop === null)) return peer;
+      const chain = hops as string[];
+      for (let i = chain.length - 1; i >= 0; i--) {
+        if (!isTrustedHop(chain[i])) return chain[i];
       }
       return peer;
     },
