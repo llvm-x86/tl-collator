@@ -711,8 +711,21 @@ async function main() {
             return;
           }
         } catch {}
+        // "Clean" is asserted only from a provider's answer: without one the verdict is unknown (round 12 / F2).
+        const noVerdict = {
+          success: false,
+          ip,
+          isBlocked: false,
+          source: 'unknown',
+          message: 'No IP reputation provider succeeded',
+          error: 'Both primary and fallback IP reputation APIs failed or are not configured.',
+        };
         try {
-          const intel = ipIntel ? await ipIntel.lookup(ip) : null;
+          if (!ipIntel) {
+            writeJson(res, 200, noVerdict);
+            return;
+          }
+          const intel = await ipIntel.lookup(ip);
           const isVpn = !!intel?.vpn;
           const isBlocked = isVpn;
           writeJson(res, 200, {
@@ -730,14 +743,7 @@ async function main() {
           return;
         } catch (e: any) {
           logInternalError('ip-intel-error', e);
-          writeJson(res, 200, {
-            success: false,
-            ip,
-            isBlocked: false,
-            source: 'unknown',
-            message: 'No IP reputation provider succeeded',
-            error: 'Both primary and fallback IP reputation APIs failed or are not configured.',
-          });
+          writeJson(res, 200, noVerdict);
           return;
         }
       }

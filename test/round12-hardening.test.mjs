@@ -2,9 +2,13 @@
 // guards against. Runs against dist/ (npm run build first).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { DC_REPLAY_HIGH_WATER_BYTES, PeerSession, broadcastTapeEntry } from '../dist/peerSession.js';
 import * as peerSession from '../dist/peerSession.js';
@@ -137,5 +141,87 @@ test('R12-F1 a replay delivers only the lines that existed when it began', { tim
     assert.deepEqual(seen, Array.from({ length: 300 }, (_, k) => k + 1), 'replay read lines appended after it began');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------- collator as a process (F2)
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const loader = path.join(root, 'scripts', 'e2e', 'wrtc-loader.mjs');
+
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+
+// Starts dist/index.js with a clean environment, as server.e2e.test.mjs does.
+async function startCollator(extraEnv = {}) {
+  const port = await freePort();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r12-e2e-'));
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME || os.homedir(), DATA_DIR: dataDir, PORT: String(port), ...extraEnv };
+  const child = spawn(process.execPath, ['--import', loader, 'dist/index.js'], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let exited = null;
+  child.stdout.on('data', () => {});
+  child.stderr.on('data', () => {});
+  child.on('exit', (code) => { exited = code; });
+  const base = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline && exited === null) {
+    try {
+      if ((await fetch(`${base}/health`)).ok) break;
+    } catch {}
+    await sleep(150);
+  }
+  const stop = () => new Promise((resolve) => {
+    if (exited !== null) return resolve();
+    child.once('exit', () => resolve());
+    child.kill('SIGTERM');
+  });
+  return { base, stop, exited: () => exited };
+}
+
+// A loopback intel provider that answers every lookup with the same verdict.
+async function startIntelStub(verdict) {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(verdict));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${server.address().port}/`, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+test('R12-F2 /attestation/ip with no reputation source fails closed instead of reporting a clean IP', { timeout: 120000 }, async () => {
+  const c = await startCollator();
+  try {
+    const res = await fetch(`${c.base}/attestation/ip`);
+    const body = await res.json();
+    assert.equal(body.success, false, `reported success with no reputation source: "${body.message}"`);
+    assert.equal(body.isBlocked, false);
+    assert.doesNotMatch(String(body.message), /clean/i);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('R12-F2 /attestation/ip with a configured intel provider still reports its verdict', { timeout: 120000 }, async () => {
+  const intel = await startIntelStub({ vpn: false, asn: 64500 });
+  const c = await startCollator({ IP_INTEL_URL: intel.url });
+  try {
+    const res = await fetch(`${c.base}/attestation/ip`);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.isBlocked, false);
+    assert.equal(body.message, 'IP is clean and trusted.');
+  } finally {
+    await c.stop();
+    await intel.close();
   }
 });
