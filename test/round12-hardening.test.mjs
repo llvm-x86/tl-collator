@@ -62,7 +62,6 @@ test('R12-F1 live entries committed during a paused replay follow the replay in 
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
     const session = new PeerSession({ id: 'f1-order', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    session.wantsTape = true;
     const served = session.serveTapeSub(ch, store, 1);
     // The replay is now parked on the full queue at seq 1.
     await sleep(30);
@@ -88,7 +87,6 @@ test('R12-F1 a newer TAPE_SUB on the same session supersedes the replay still pa
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
     const session = new PeerSession({ id: 'f1-supersede', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    session.wantsTape = true;
     const first = session.serveTapeSub(ch, store, 1);
     await sleep(30);
     const second = session.serveTapeSub(ch, store, 1);
@@ -111,7 +109,6 @@ test('R12-F1 live entries held past the bound close the channel and end the repl
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
     const session = new PeerSession({ id: 'f1-held', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    session.wantsTape = true;
     const served = session.serveTapeSub(ch, store, 1);
     await sleep(30);
     // Held entries are bounded by bytes (R13-3): about 400 KB each, so a few of them pass the bound.

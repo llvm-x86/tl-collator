@@ -140,7 +140,6 @@ async function runSchedule(seed) {
     const subscribe = (from) => {
       if (!current || current.readyState !== 'open') attach();
       const ch = current;
-      session.wantsTape = true;
       const sent = ch.msgs.slice(ch.msgs.findLastIndex((m) => m.t === 'TAPE_END') + 1);
       ch.subscribed = true;
       ch.requested = from;
@@ -202,7 +201,6 @@ test('R13-1 a superseding TAPE_SUB continues the channel after the seqs it alrea
     const ch = makeChannel({ parkAfter: 50 });
     const session = new PeerSession({ id: 'r13-1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    session.wantsTape = true;
     const first = session.serveTapeSub(ch, store, 1);
     while (tapeSeqs(ch.msgs).length < 50) await sleep(2);
     ch.requested = 1;
@@ -227,7 +225,6 @@ test('R13-2 a channel attached while a replay is in flight is closed, and carrie
     a.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
     const session = new PeerSession({ id: 'r13-2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = a;
-    session.wantsTape = true;
     const served = session.serveTapeSub(a, store, 1);
     await sleep(20);
     const held = [21, 22, 23].map((i) => store.append(orderFor(i)));
@@ -259,7 +256,6 @@ test('R13-4 a replay past its deadline ends with the channel closed and no TAPE_
     }, 1);
     const session = new PeerSession({ id: 'r13-4', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    session.wantsTape = true;
     const started = Date.now();
     await session.serveTapeSub(ch, store, 1, { stallMs: 60_000, deadlineMs: 300 });
     clearInterval(drain);

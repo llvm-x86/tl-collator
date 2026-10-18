@@ -75,8 +75,9 @@ export class PeerSession {
   readonly ws: WebSocket;
   dc: RTCDataChannel | null = null;
 
-  // True once the current channel has sent a TAPE_SUB. Live entries go only to a subscribed channel,
-  // so a channel's stream always starts at its own TAPE_SUB, never with live entries it cannot backfill.
+  // True once a TAPE_SUB on the current channel has been served. Live entries go only to a subscribed
+  // channel, so a channel's stream always starts at its own served TAPE_SUB, never with live entries
+  // it cannot backfill.
   wantsTape: boolean = false;
 
   // The stream this session is serving, if any (see TapeStream).
@@ -203,6 +204,7 @@ export class PeerSession {
     const start = run ? Math.max(fromSeq, run.seq + 1) : fromSeq;
     const stream: TapeStream = { channel, deadline: Date.now() + (opts.deadlineMs ?? DC_REPLAY_MAX_MS), held: [], heldBytes: 0 };
     this.stream = stream;
+    this.wantsTape = true;
     try {
       const range = await tape.replayFromSeq(start, (e) => this.sendStreamEntry(stream, e, opts.stallMs));
       while (this.streamIsCurrent(stream) && stream.held.length > 0) {

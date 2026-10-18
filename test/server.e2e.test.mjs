@@ -11,6 +11,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 
+import { computeEnvelopeHash } from '../dist/canonical.js';
+import { pubKeyFromPrivKeyHex, signWithPrivKeyHex } from '../dist/crypto.js';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const loader = path.join(root, 'scripts', 'e2e', 'wrtc-loader.mjs');
 
@@ -431,6 +434,80 @@ test('signal: SIGNAL_OFFER is paced per session; a flood is answered rate_limite
     assert.ok(limited >= 5, `only ${limited} of 10 offers were paced`);
   } finally {
     ws.close();
+    await c.stop();
+  }
+});
+
+// A DataChannel peer over the real signalling socket. The collator's channel is the fake from
+// scripts/e2e/wrtc-fake.mjs (TL_E2E_WRTC=fake): `wire` is what the collator sent on it, `send` is
+// what the peer sends, and `closed` is set when the collator closes the channel.
+async function openDataPeer(port) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const peer = { ws, wire: [], answered: false, closed: false };
+  ws.on('message', (d) => {
+    const m = JSON.parse(d.toString());
+    if (m.t === 'SIGNAL_ANSWER') peer.answered = true;
+    if (m.t !== 'SIGNAL_ICE') return;
+    const text = m.candidate?.candidate ?? '';
+    if (text.startsWith('out:')) peer.wire.push(JSON.parse(text.slice(4)));
+    if (text === 'closed') peer.closed = true;
+  });
+  await new Promise((resolve, reject) => {
+    ws.once('open', resolve);
+    ws.once('error', reject);
+  });
+  ws.send(JSON.stringify({ t: 'SIGNAL_OFFER', v: 1, kind: 'offer', sdp: 'fake-offer' }));
+  await waitUntil(() => peer.answered, 5000, 'SIGNAL_ANSWER');
+  peer.send = (msg) => ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: `in:${JSON.stringify(msg)}` } }));
+  return peer;
+}
+
+async function waitUntil(cond, ms, what) {
+  const until = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > until) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+const tapeEntries = (peer) => peer.wire.filter((m) => m.t === 'TAPE_ENTRY').map((m) => m.entry.seq);
+
+// A correctly signed NEW order; `n` makes each one distinct.
+function signedOrder(n) {
+  const traderPriv = '11'.repeat(32);
+  const env = {
+    v: 1,
+    kind: 'NEW',
+    body: { v: 1, market: 'SPOT:LTC/TL', side: 'BUY', px: '1', qty: '1', visibility: { kind: 'PUBLIC' }, clientTs: 1 },
+    traderPubKey: pubKeyFromPrivKeyHex(traderPriv),
+    clientNonce: n.toString(16).padStart(2, '0'),
+  };
+  const orderId = computeEnvelopeHash(env);
+  return { ...env, orderId, sigTrader: signWithPrivKeyHex(orderId, traderPriv) };
+}
+
+test('R15-1 a TAPE_SUB refused by the per-IP gate leaves its channel unsubscribed: no live entry reaches it without a backfill', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    // A is served: its replay of the empty tape starts the one-per-second window for this IP.
+    const a = await openDataPeer(c.port);
+    a.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => a.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on A');
+    // B reconnects inside that window and asks for seqs from 3. The gate refuses it.
+    const b = await openDataPeer(c.port);
+    b.send({ t: 'TAPE_SUB', v: 1, fromSeq: 3 });
+    await waitUntil(() => b.wire.some((m) => m.t === 'ERR'), 5000, 'an ERR on B');
+    assert.deepEqual(b.wire.map((m) => m.t === 'ERR' ? m.code : m.t), ['rate_limited'], 'B was not refused by the gate');
+    // Two entries commit on A, the subscribed channel. Then one more.
+    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(1) });
+    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(2) });
+    await waitUntil(() => tapeEntries(a).length === 2, 5000, 'two live entries on A');
+    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(3) });
+    await waitUntil(() => tapeEntries(a).length === 3, 5000, 'a third live entry on A');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(tapeEntries(b), [], 'B received live entries after its refused TAPE_SUB, with seqs 1..2 never sent to it');
+    assert.deepEqual(b.wire.map((m) => m.t), ['ERR'], 'B carried more than the refusal');
+  } finally {
     await c.stop();
   }
 });

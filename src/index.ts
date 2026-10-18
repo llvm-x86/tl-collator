@@ -1420,13 +1420,10 @@ async function main() {
                 }
 
                 if (wm.t === 'TAPE_SUB') {
-                  // Register the live subscription first: the rate limit below
-                  // only guards the full tape *replay* — returning early must
-                  // never silently drop the client's live feed.
-                  if (sess.dc === dc) sess.wantsTape = true;
-                  // H3c: rate-limit full tape re-reads per client IP (not per session).
+                  // H3c: rate-limit full tape re-reads per client IP (not per session). A refused
+                  // request does not subscribe the channel: live entries follow only a served TAPE_SUB.
                   if (!tapeResyncGate.allow(ipKey)) {
-                    sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed' });
+                    sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second' });
                     return;
                   }
                   const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
