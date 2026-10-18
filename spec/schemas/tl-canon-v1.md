@@ -22,6 +22,9 @@ Rules:
   number is judged by its value, so `1.0` is `1` (vector `integralNumberTest`).
   Any other number (fraction, NaN, Infinity, out of range) has no TL-Canon form
   and MUST be rejected, never serialized. Monetary values must be strings.
+  The value is the one the number's text denotes, not the double a parser makes of it: a
+  safe integer written with a non-zero fraction (`9007199254740991.0000000000000001`)
+  MUST be rejected, since a parser that rounds it would accept a value the text does not state.
 - Omit keys whose value is `undefined`, a function or a symbol.
 - Accessor properties are never invoked; only data properties are serialized.
 - Strings: must be well-formed Unicode. A lone UTF-16 surrogate has no UTF-8

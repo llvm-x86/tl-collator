@@ -14,6 +14,7 @@ Usage:
 import hashlib
 import json
 import sys
+from decimal import Decimal
 
 MAX_SAFE = 2**53 - 1
 
@@ -89,6 +90,19 @@ def canon(v) -> str:
     raise TypeError("TL-Canon: unsupported type %r" % type(v).__name__)
 
 
+def parse_canonical_text(text: str):
+    """Parses JSON text as TL-Canon input. A number whose value is a safe integer must be written as
+    that integer: float() rounds, so "9007199254740991.0000000000000001" reads as the integer
+    9007199254740991, and the exact text is compared with the value here. Other numbers are left to
+    canon(), which refuses any that is not a safe integer."""
+    def number(token: str) -> float:
+        f = float(token)
+        if f.is_integer() and abs(f) <= MAX_SAFE and Decimal(token) != int(f):
+            raise ValueError("TL-Canon: number %s is not written as the integer %d" % (token, int(f)))
+        return f
+    return json.loads(text, parse_float=number)
+
+
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -158,6 +172,26 @@ def main() -> int:
             accepted = False
         print("%-42s %s" % ("reject: " + case["name"], "MISMATCH (accepted)" if accepted else "OK"))
         if accepted:
+            failures += 1
+
+    # Text-level inputs: the number as written must be the integer its value shows.
+    for case in vectors["textRejectTests"]:
+        try:
+            parse_canonical_text(case["text"])
+            accepted = True
+        except (ValueError, TypeError):
+            accepted = False
+        print("%-42s %s" % ("text reject: " + case["name"], "MISMATCH (accepted)" if accepted else "OK"))
+        if accepted:
+            failures += 1
+    for case in vectors["textAcceptTests"]:
+        try:
+            parse_canonical_text(case["text"])
+            accepted = True
+        except (ValueError, TypeError):
+            accepted = False
+        print("%-42s %s" % ("text accept: " + case["name"], "OK" if accepted else "MISMATCH (refused)"))
+        if not accepted:
             failures += 1
 
     # Discriminating power: emulate the old `JSON.stringify`-based canonicalizer

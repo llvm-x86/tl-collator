@@ -148,5 +148,41 @@
         "\udc00": 1
       }
     }
+  ],
+  "textRejectTests": [
+    {
+      "name": "fraction that JSON.parse rounds to a safe integer",
+      "text": "{\"qty\":9007199254740991.0000000000000001}"
+    },
+    {
+      "name": "fraction just below a safe integer",
+      "text": "{\"qty\":9007199254740990.9999999999999999}"
+    },
+    {
+      "name": "integral value with a non-zero tail, in an array",
+      "text": "[3.0000000000000000001]"
+    },
+    {
+      "name": "exponent form with a non-zero tail, nested",
+      "text": "{\"body\":{\"clientTs\":1.00000000000000000001e0}}"
+    }
+  ],
+  "textAcceptTests": [
+    {
+      "name": "1.0 has the value of 1",
+      "text": "{\"qty\":1.0}"
+    },
+    {
+      "name": "exponent form and negative zero of safe integers",
+      "text": "[1e3, 9007199254740991e0, -0]"
+    },
+    {
+      "name": "trailing zeros after the point of a safe integer",
+      "text": "{\"qty\":9007199254740991.000}"
+    },
+    {
+      "name": "non-integer below the safe range is left to the value rules",
+      "text": "[0.5]"
+    }
   ]
 }

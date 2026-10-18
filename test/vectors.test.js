@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { computeEnvelopeHash, computeOrderId, envelopeSignedFields, stableStringify } from '../dist/canonical.js';
+import { computeEnvelopeHash, computeOrderId, envelopeSignedFields, parseCanonicalJson, stableStringify } from '../dist/canonical.js';
 import { sha256Hex } from '../dist/crypto.js';
 import { TapeStore } from '../dist/tape.js';
 import { loadValidators } from '../dist/schema.js';
@@ -192,6 +192,15 @@ test('TL-Canon: integer-like, astral and integral-number vectors match the spec'
 test('TL-Canon: every rejectTests input is refused, never serialized', () => {
   for (const c of vectors.rejectTests) {
     assert.throws(() => stableStringify(c.input), TypeError, c.name);
+  }
+});
+
+test('TL-Canon text: a safe integer written as a fraction is refused at parse; the other numbers are left to the value rules', () => {
+  for (const c of vectors.textRejectTests) {
+    assert.equal(parseCanonicalJson(c.text), null, c.name);
+  }
+  for (const c of vectors.textAcceptTests) {
+    assert.notEqual(parseCanonicalJson(c.text), null, c.name);
   }
 });
 

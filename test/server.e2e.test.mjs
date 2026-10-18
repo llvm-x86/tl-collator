@@ -473,13 +473,13 @@ async function waitUntil(cond, ms, what) {
 
 const tapeEntries = (peer) => peer.wire.filter((m) => m.t === 'TAPE_ENTRY').map((m) => m.entry.seq);
 
-// A correctly signed NEW order; `n` makes each one distinct.
-function signedOrder(n) {
+// A correctly signed NEW order; `n` makes each one distinct and `body` overrides its body fields.
+function signedOrder(n, body = {}) {
   const traderPriv = '11'.repeat(32);
   const env = {
     v: 1,
     kind: 'NEW',
-    body: { v: 1, market: 'SPOT:LTC/TL', side: 'BUY', px: '1', qty: '1', visibility: { kind: 'PUBLIC' }, clientTs: 1 },
+    body: { v: 1, market: 'SPOT:LTC/TL', side: 'BUY', px: '1', qty: '1', visibility: { kind: 'PUBLIC' }, clientTs: 1, ...body },
     traderPubKey: pubKeyFromPrivKeyHex(traderPriv),
     clientNonce: n.toString(16).padStart(2, '0'),
   };
@@ -532,6 +532,30 @@ test('R15-2 a TAPE_SUB whose fromSeq is not a non-negative safe integer is refus
     a.send({ t: 'TAPE_SUB', v: 1, fromSeq: 0 });
     await waitUntil(() => a.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END for fromSeq 0');
     assert.equal(a.wire.at(-1).fromSeq, 1);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('R15-5 a SUBMIT whose number is written with digits its value does not show is refused, not admitted', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    const a = await openDataPeer(c.port);
+    a.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => a.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on A');
+    // The order is signed over the integer 9007199254740991. Its text names a fraction that JSON.parse
+    // rounds to that integer, so a client that parses the text exactly derives a different orderId.
+    const order = signedOrder(1, { clientTs: Number.MAX_SAFE_INTEGER });
+    const text = JSON.stringify({ t: 'SUBMIT', v: 1, order }).replace(
+      `"clientTs":${Number.MAX_SAFE_INTEGER}`,
+      `"clientTs":${Number.MAX_SAFE_INTEGER}.0000000000000001`,
+    );
+    a.sendRaw(text);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.deepEqual(tapeEntries(a), [], 'the SUBMIT with a fraction in its text was admitted');
+    // The same order written as the integer is admitted: the channel is alive and the refusal was the number.
+    a.send({ t: 'SUBMIT', v: 1, order });
+    await waitUntil(() => tapeEntries(a).length === 1, 5000, 'the honest SUBMIT on A');
   } finally {
     await c.stop();
   }

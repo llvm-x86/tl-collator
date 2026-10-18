@@ -19,6 +19,7 @@ import { ConcurrencyCounter, KeyedTokenBuckets, MinIntervalGate, TokenBucket } f
 import { clientKeyForIp, createClientIpResolver } from './clientIp.js';
 import { ClearlistClient } from './clearlist.js';
 import { loadValidators } from './schema.js';
+import { parseCanonicalJson } from './canonical.js';
 import { buildManifest } from './manifest.js';
 import { IpIntelClient } from './ipIntel.js';
 import { AuditLog } from './auditLog.js';
@@ -1328,7 +1329,7 @@ async function main() {
                   return;
                 }
                 const txt = typeof ev2.data === 'string' ? ev2.data : Buffer.from(ev2.data).toString('utf8');
-                const wm = safeJsonParse(txt) as WireMsg | null;
+                const wm = parseCanonicalJson(txt) as WireMsg | null;
                 if (!wm || !isWireMsg(wm)) return;
                 sess.meta.lastSeenTs = Date.now();
                 const refusal = schemas.wireRefusal(wm);

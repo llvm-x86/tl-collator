@@ -65,6 +65,57 @@ export function findCanonicalViolation(v: unknown): string | null {
   return violationAt(v, 0);
 }
 
+// JSON.parse keeps a number's value, not its text, and rounds: "9007199254740991.0000000000000001"
+// parses to the integer 9007199254740991. The reviver's source text (Node 21+) lets the number be
+// judged as written. A runtime without it would judge nothing, so it is refused at load.
+const JSON_SOURCE_TEXT: boolean = (() => {
+  let seen = false;
+  JSON.parse('1', (_key, value, context?: { source?: string }) => {
+    seen = typeof context?.source === 'string';
+    return value;
+  });
+  return seen;
+})();
+if (!JSON_SOURCE_TEXT) throw new Error('TL-Canon needs JSON number source text (Node 21 or later)');
+
+/** The integer a JSON number token denotes, or null when its exact value is not an integer. */
+function exactInteger(token: string): bigint | null {
+  const m = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+  if (!m) return null;
+  const [, sign, whole, fraction = '', exponent = '0'] = m;
+  let digits = (whole + fraction).replace(/^0+/, '');
+  if (digits === '') return 0n;
+  const shift = Number(exponent) - fraction.length;
+  // Only safe integers are compared, and those have at most 16 digits: a longer value is not one of them.
+  if (shift > 16) return null;
+  if (shift >= 0) {
+    digits += '0'.repeat(shift);
+  } else {
+    const cut = -shift;
+    if (digits.length <= cut || /[1-9]/.test(digits.slice(-cut))) return null;
+    digits = digits.slice(0, -cut);
+  }
+  return BigInt(sign + digits);
+}
+
+/**
+ * Parses JSON text as TL-Canon input. Returns null for text that is not JSON, or that holds a safe
+ * integer not written as that integer (the value is 9007199254740991 but the text is a fraction).
+ * Other numbers are left to findCanonicalViolation, which refuses any that is not a safe integer.
+ */
+export function parseCanonicalJson(text: string): unknown {
+  try {
+    return JSON.parse(text, (_key, value, context?: { source?: string }) => {
+      if (typeof value === 'number' && Number.isSafeInteger(value) && exactInteger(context?.source ?? '') !== BigInt(value)) {
+        throw new SyntaxError('number is not written as the integer its value shows');
+      }
+      return value;
+    });
+  } catch {
+    return null;
+  }
+}
+
 // TL-Canon v1 key order: ascending Unicode **code point** (shortest prefix
 // first) — NOT `JSON.stringify` object order. JSON.stringify emits
 // integer-like keys ("9", "10", ...) first in numeric order, which silently
