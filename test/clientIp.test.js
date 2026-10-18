@@ -62,8 +62,8 @@ test('N3: single-valued client-IP headers are never believed, even from a truste
 });
 
 test('config: a /0 trusted hop (matches every peer) is refused', () => {
-  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '0.0.0.0/0' }), /matches every address/);
-  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '::/0' }), /matches every address/);
+  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '0.0.0.0/0' }), /too broad/);
+  assert.throws(() => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: '::/0' }), /too broad/);
 });
 
 test('N3: X-Forwarded-For is walked right to left past trusted hops; a client-prepended entry is ignored', () => {

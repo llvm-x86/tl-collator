@@ -263,3 +263,22 @@ test('R12-F3 a clearlist answer admits only a boolean true', { timeout: 60000 },
     }
   }
 });
+
+// ------------------------------------------------------- broad trusted hops (F4)
+
+test('R12-F4 a trusted hop broader than /8 (IPv4) or /16 (IPv6) is refused unless explicitly allowed', async () => {
+  const { parseTrustedProxyConfig, createClientIpResolver } = await import('../dist/clientIp.js');
+  const trust = (cidrs, extra = {}) => parseTrustedProxyConfig({ TRUST_PROXY: '1', TRUST_PROXY_CIDRS: cidrs, ...extra });
+  for (const broad of ['0.0.0.0/0', '::/0', '0.0.0.0/1', '128.0.0.0/1', '10.0.0.0/7', '2000::/3', '2001::/15']) {
+    assert.throws(() => trust(broad), /too broad/, `${broad} was accepted as a trusted hop`);
+  }
+  for (const narrow of ['10.0.0.0/8', '192.168.0.0/16', '2001:db8::/32', '10.0.0.1']) {
+    assert.doesNotThrow(() => trust(narrow), `${narrow} was refused`);
+  }
+  // The explicit opt-in admits a broad entry, and the resolver then trusts exactly what it names.
+  const optIn = trust('0.0.0.0/1', { TRUST_PROXY_ALLOW_BROAD_CIDRS: '1' });
+  const resolver = createClientIpResolver(optIn);
+  const req = { headers: { 'x-forwarded-for': '200.0.0.1' }, socket: { remoteAddress: '1.2.3.4' } };
+  assert.equal(resolver.resolve(req), '200.0.0.1');
+  assert.throws(() => trust('0.0.0.0/1', { TRUST_PROXY_ALLOW_BROAD_CIDRS: 'yes' }), /TRUST_PROXY_ALLOW_BROAD_CIDRS/);
+});

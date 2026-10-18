@@ -102,13 +102,12 @@ function parseCidr(entry: string): ParsedCidr {
   if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
     throw new Error(`TRUST_PROXY_CIDRS: "${entry}" has an invalid prefix length`);
   }
-  // A /0 hop would make every TCP peer a trusted proxy, i.e. any client could
-  // choose its own IP. Refuse it: hops must be listed explicitly.
-  if (prefix === 0) {
-    throw new Error(`TRUST_PROXY_CIDRS: "${entry}" matches every address; list the proxy hops explicitly`);
-  }
   return { addr, prefix, family: family === 4 ? 'ipv4' : 'ipv6' };
 }
+
+// A trusted hop this broad lets a large share of clients choose their own IP (round 12 / F4). The
+// bounds are the relayer's: IPv4 shorter than /8, IPv6 shorter than /16 (the /0 case is included).
+const isBroadCidr = (c: ParsedCidr): boolean => (c.family === 'ipv4' ? c.prefix < 8 : c.prefix < 16);
 
 /**
  * Reads TRUST_PROXY / TRUST_PROXY_CIDRS. Throws on anything ambiguous so the
@@ -120,8 +119,19 @@ export function parseTrustedProxyConfig(env: NodeJS.ProcessEnv): TrustedProxyCon
     throw new Error(`TRUST_PROXY must be 0 or 1 (got "${raw}")`);
   }
   const enabled = raw === '1';
+  const allowRaw = String(env.TRUST_PROXY_ALLOW_BROAD_CIDRS ?? '').trim();
+  if (allowRaw !== '' && allowRaw !== '0' && allowRaw !== '1') {
+    throw new Error(`TRUST_PROXY_ALLOW_BROAD_CIDRS must be 0 or 1 (got "${allowRaw}")`);
+  }
   const cidrs = String(env.TRUST_PROXY_CIDRS ?? '').split(/[\s,]+/).filter(Boolean);
-  for (const entry of cidrs) parseCidr(entry);
+  for (const entry of cidrs) {
+    const parsed = parseCidr(entry);
+    if (allowRaw !== '1' && isBroadCidr(parsed)) {
+      throw new Error(
+        `TRUST_PROXY_CIDRS: "${entry}" is too broad to trust (it lets a large share of clients choose their own IP); list the real proxy hops, or set TRUST_PROXY_ALLOW_BROAD_CIDRS=1`,
+      );
+    }
+  }
   if (!enabled && cidrs.length > 0) {
     throw new Error('TRUST_PROXY_CIDRS is set but TRUST_PROXY is not 1; set TRUST_PROXY=1 or unset TRUST_PROXY_CIDRS');
   }
