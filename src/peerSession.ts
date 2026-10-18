@@ -70,6 +70,23 @@ interface TapeStream {
 /** Bytes a TAPE_ENTRY takes on the wire, counted the way the held run is bounded. */
 const entryBytes = (entry: TapeEntryV1): number => dcMessageBytes(JSON.stringify(entry));
 
+/** Why the collator closes a tape channel. The code is stable: the peer reads it to tell a resync from a dead channel. */
+interface CloseReason {
+  code: 'resync_required' | 'stalled' | 'deadline_exceeded';
+  msg: string;
+}
+
+/**
+ * Sends an ERR on a channel that is about to close. Best effort: a channel that cannot take the
+ * message (for example one whose queue is full) is closed all the same.
+ */
+function sendErrOn(channel: RTCDataChannel, reason: CloseReason): void {
+  if (channel.readyState !== 'open') return;
+  try {
+    channel.send(JSON.stringify({ t: 'ERR', v: 1, code: reason.code, msg: reason.msg }));
+  } catch {}
+}
+
 export class PeerSession {
   readonly id: string;
   readonly ws: WebSocket;
@@ -140,14 +157,15 @@ export class PeerSession {
   }
 
   /**
-   * Closes the session's channel and ends the stream on it. The peer resubscribes on its next
-   * channel, from its own position.
+   * Closes the session's channel and ends the stream on it. A close the collator starts for a stated
+   * reason sends that ERR first. The peer resubscribes on its next channel, from its own position.
    */
-  dropChannel(): void {
+  dropChannel(reason?: CloseReason): void {
     const dc = this.dc;
     this.dc = null;
     this.stream = null;
     this.wantsTape = false;
+    if (dc && reason) sendErrOn(dc, reason);
     try {
       dc?.close();
     } catch {}
@@ -198,7 +216,7 @@ export class PeerSession {
     if (this.dc !== channel || channel.readyState !== 'open') return;
     const run = this.tail?.channel === channel ? this.tail : null;
     if (run && fromSeq < run.first) {
-      this.dropChannel();
+      this.dropChannel({ code: 'resync_required', msg: 'TAPE_SUB starts before this channel\'s run; resubscribe on a new channel' });
       return;
     }
     const start = run ? Math.max(fromSeq, run.seq + 1) : fromSeq;
@@ -238,8 +256,7 @@ export class PeerSession {
     }
     const bytes = entryBytes(entry);
     if (stream.heldBytes + bytes > DC_REPLAY_MAX_HELD_BYTES) {
-      this.sendDc({ t: 'ERR', v: 1, code: 'resync_required', msg: 'live entries outran the replay; resubscribe from your last seq' });
-      this.dropChannel();
+      this.dropChannel({ code: 'resync_required', msg: 'live entries outran the replay; resubscribe from your last seq' });
       return;
     }
     stream.held.push({ entry, bytes });
@@ -258,7 +275,7 @@ export class PeerSession {
     for (;;) {
       if (!this.streamIsCurrent(stream)) return false;
       if (Date.now() > stream.deadline) {
-        this.dropChannel();
+        this.dropChannel({ code: 'deadline_exceeded', msg: 'replay ran past its deadline; resubscribe from your last seq' });
         return false;
       }
       if (channel.bufferedAmount <= DC_REPLAY_HIGH_WATER_BYTES) return this.sendTapeEntry(entry);
@@ -267,7 +284,7 @@ export class PeerSession {
         queued = channel.bufferedAmount;
         progressAt = Date.now();
       } else if (Date.now() - progressAt > stallMs) {
-        this.dropChannel();
+        this.dropChannel({ code: 'stalled', msg: 'replay queue stopped draining; resubscribe from your last seq' });
         return false;
       }
     }

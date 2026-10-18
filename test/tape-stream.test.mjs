@@ -266,3 +266,69 @@ test('R13-4 a replay past its deadline ends with the channel closed and no TAPE_
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// R15-3: every close the collator starts on a tape channel says why first, so the peer can tell a
+// resync request from a dead channel. The ERR is the last message the channel carries.
+const errCodes = (ch) => ch.msgs.filter((m) => m.t === 'ERR').map((m) => m.code);
+
+test('R15-3 a TAPE_SUB below the channel run closes the channel after an ERR resync_required', { timeout: 20000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r15-below-'));
+  try {
+    const store = openStore(dir);
+    for (let i = 1; i <= 30; i += 1) store.append(orderFor(i));
+    // A replay from 10 is parked after three entries: the run this channel carries is 10..12.
+    const ch = makeChannel({ parkAfter: 3 });
+    const session = new PeerSession({ id: 'r15-3-below', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    session.attachDataChannel(ch);
+    const first = session.serveTapeSub(ch, store, 10, { stallMs: 60_000, deadlineMs: 60_000 });
+    while (tapeSeqs(ch.msgs).length < 3) await sleep(2);
+    await session.serveTapeSub(ch, store, 5);
+    await first;
+    assert.deepEqual(tapeSeqs(ch.msgs), range(10, 12));
+    assert.equal(ch.closed, 1, 'a request below the run kept its channel');
+    assert.deepEqual(errCodes(ch), ['resync_required'], 'the close carried no reason');
+    assert.equal(ch.msgs.at(-1).t, 'ERR', 'the ERR is not the last message before the close');
+    assert.equal(ch.sentAfterClose, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R15-3 a replay whose peer stops draining closes the channel after an ERR stalled', { timeout: 20000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r15-stall-'));
+  try {
+    const store = openStore(dir);
+    for (let i = 1; i <= 30; i += 1) store.append(orderFor(i));
+    const ch = makeChannel({ parkAfter: 3 });
+    const session = new PeerSession({ id: 'r15-3-stall', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    session.attachDataChannel(ch);
+    await session.serveTapeSub(ch, store, 1, { stallMs: 50, deadlineMs: 60000 });
+    assert.equal(ch.closed, 1, 'a stalled replay kept its channel');
+    assert.deepEqual(errCodes(ch), ['stalled'], 'the stall close carried no reason');
+    assert.equal(ch.msgs.at(-1).t, 'ERR', 'the ERR is not the last message before the close');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R15-3 a replay past its deadline closes the channel after an ERR deadline_exceeded', { timeout: 20000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r15-deadline-'));
+  try {
+    const store = openStore(dir);
+    for (let i = 1; i <= 30; i += 1) store.append(orderFor(i));
+    const ch = makeChannel({ onSend: (c) => { c.bufferedAmount += 1000; } });
+    ch.bufferedAmount = DC_REPLAY_HIGH_WATER_BYTES + 1;
+    const drain = setInterval(() => {
+      ch.bufferedAmount = Math.max(0, ch.bufferedAmount - 50);
+    }, 1);
+    const session = new PeerSession({ id: 'r15-3-deadline', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    session.attachDataChannel(ch);
+    await session.serveTapeSub(ch, store, 1, { stallMs: 60_000, deadlineMs: 300 });
+    clearInterval(drain);
+    assert.equal(ch.closed, 1, 'a replay past its deadline kept its channel');
+    assert.deepEqual(errCodes(ch), ['deadline_exceeded'], 'the deadline close carried no reason');
+    assert.equal(ch.msgs.at(-1).t, 'ERR', 'the ERR is not the last message before the close');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
