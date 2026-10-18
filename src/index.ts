@@ -1316,8 +1316,9 @@ async function main() {
 
           pc.ondatachannel = (ev: any) => {
             const dc: RTCDataChannel = ev.channel;
-            // Round 8: one live channel per session; the one it replaces is closed.
-            sess.attachDataChannel(dc);
+            // Round 8: one live channel per session; the one it replaces is closed. A channel opened
+            // during a replay is refused (see PeerSession.attachDataChannel).
+            if (!sess.attachDataChannel(dc)) return;
 
             dc.onmessage = async (ev2: any) => {
               try {

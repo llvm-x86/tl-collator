@@ -183,7 +183,7 @@ test('R10-REPLAY a stalled channel ends the replay and is closed (no hang)', { t
   }
 });
 
-test('R10-REPLAY a replay stops when its channel is replaced by a newer one', async () => {
+test('R10-REPLAY a channel attached while a replay runs is refused with busy_retry; the replay finishes on its own channel', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r10-swap-'));
   try {
     const tapePath = writeTape(dir, 300, 100);
@@ -191,18 +191,22 @@ test('R10-REPLAY a replay stops when its channel is replaced by a newer one', as
     const old = fakeChannel();
     const fresh = fakeChannel();
     const session = new PeerSession({ id: 'p3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
-    session.dc = old;
-    // The swap happens right after the 49th entry leaves the old channel.
+    session.attachDataChannel(old);
+    // The attach happens right after the 49th entry leaves the old channel.
     const sendOld = old.send;
     old.send = function (data) {
       sendOld.call(this, data);
-      if (this.sent.length === 49) session.attachDataChannel(fresh);
+      if (this.sent.length === 49) assert.equal(session.attachDataChannel(fresh), false);
     };
     await session.serveTapeSub(old, store, 1);
     old.stop();
     fresh.stop();
-    assert.equal(fresh.sent.length, 0, 'replaced channel delivered entries to the successor');
-    assert.equal(old.sent.length, 49, 'replay ran on after its channel was replaced');
+    const freshMsgs = fresh.sent.map((d) => JSON.parse(d));
+    assert.deepEqual(freshMsgs.map((m) => (m.t === 'ERR' ? m.code : m.t)), ['busy_retry'], 'the channel attached mid-replay was not refused with busy_retry');
+    assert.equal(fresh.closed, 1, 'the refused channel stayed open');
+    const oldMsgs = old.sent.map((d) => JSON.parse(d));
+    assert.deepEqual(oldMsgs.filter((m) => m.t === 'TAPE_ENTRY').map((m) => m.entry.seq), Array.from({ length: 300 }, (_, k) => k + 1), 'the replay in flight did not finish on its channel');
+    assert.equal(oldMsgs.at(-1).t, 'TAPE_END');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

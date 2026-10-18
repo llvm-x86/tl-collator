@@ -60,6 +60,7 @@ const openStore = (dir) => new TapeStore({
 });
 
 const tapeSeqs = (msgs) => msgs.filter((m) => m.t === 'TAPE_ENTRY').map((m) => m.entry.seq);
+const errCodes = (ch) => ch.msgs.filter((m) => m.t === 'ERR').map((m) => m.code);
 const range = (a, b) => Array.from({ length: Math.max(0, b - a + 1) }, (_, k) => a + k);
 const mulberry32 = (seed) => () => {
   seed |= 0;
@@ -124,11 +125,12 @@ async function runSchedule(seed) {
     const serves = [];
     let current = null;
     let nextOrder = 1;
+    const refused = [];
     const attach = () => {
       const ch = makeChannel();
       channels.push(ch);
-      session.attachDataChannel(ch);
-      current = ch;
+      if (session.attachDataChannel(ch)) current = ch;
+      else refused.push(ch);
     };
     // The wallet's position: the highest seq n such that it has received 1..n on any channel.
     const position = () => {
@@ -180,6 +182,11 @@ async function runSchedule(seed) {
     await Promise.all(serves);
 
     for (const ch of channels) assertOrderedStreams(ch, label);
+    for (const ch of refused) {
+      assert.equal(ch.closed, 1, `${label}: a refused channel stayed open`);
+      assert.deepEqual(errCodes(ch), ['busy_retry'], `${label}: a refused channel was not told to retry`);
+      assert.deepEqual(tapeSeqs(ch.msgs), [], `${label}: a refused channel carried entries`);
+    }
     assertLiveReach(commits, label);
     assert.equal(position(), store.getLastSeq(), `${label}: the wallet cannot resync to the tip`);
   } finally {
@@ -216,7 +223,7 @@ test('R13-1 a superseding TAPE_SUB continues the channel after the seqs it alrea
   }
 });
 
-test('R13-2 a channel attached while a replay is in flight is closed, and carries no tape entry', { timeout: 20000 }, async () => {
+test('R13-2 a channel attached while a replay is in flight is refused with ERR busy_retry; the replay finishes on its channel', { timeout: 20000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r13-replace-'));
   try {
     const store = openStore(dir);
@@ -224,19 +231,23 @@ test('R13-2 a channel attached while a replay is in flight is closed, and carrie
     const a = makeChannel();
     a.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
     const session = new PeerSession({ id: 'r13-2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
-    session.dc = a;
+    session.attachDataChannel(a);
     const served = session.serveTapeSub(a, store, 1);
     await sleep(20);
     const held = [21, 22, 23].map((i) => store.append(orderFor(i)));
     for (const e of held) broadcastTapeEntry([session], e);
     const b = makeChannel();
-    session.attachDataChannel(b);
+    assert.equal(session.attachDataChannel(b), false, 'a channel attached during a replay was adopted');
     broadcastTapeEntry([session], store.append(orderFor(24)));
     a.bufferedAmount = 0;
     await served;
-    assert.equal(b.closed, 1, 'the successor of an interrupted replay stayed open with no replay');
-    assert.deepEqual(tapeSeqs(b.msgs), [], 'the successor carried entries without a TAPE_SUB of its own');
-    assert.equal(a.msgs.filter((m) => m.t === 'TAPE_END').length, 0, 'the interrupted replay sent TAPE_END');
+    assert.equal(b.closed, 1, 'the refused channel stayed open');
+    assert.deepEqual(errCodes(b), ['busy_retry'], 'the refused channel was not told to retry');
+    assert.deepEqual(tapeSeqs(b.msgs), [], 'the refused channel carried entries');
+    assert.equal(a.closed, 0, 'the refusal closed the channel whose replay was in flight');
+    assert.deepEqual(tapeSeqs(a.msgs), range(1, 24), 'the replay in flight did not finish in order');
+    assert.equal(a.msgs.at(-1).t, 'TAPE_END', 'the replay in flight did not end');
+    assert.equal(session.dc, a, 'the session moved off the channel whose replay was in flight');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -269,8 +280,6 @@ test('R13-4 a replay past its deadline ends with the channel closed and no TAPE_
 
 // R15-3: every close the collator starts on a tape channel says why first, so the peer can tell a
 // resync request from a dead channel. The ERR is the last message the channel carries.
-const errCodes = (ch) => ch.msgs.filter((m) => m.t === 'ERR').map((m) => m.code);
-
 test('R15-3 a TAPE_SUB below the channel run closes the channel after an ERR resync_required', { timeout: 20000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r15-below-'));
   try {

@@ -72,7 +72,7 @@ const entryBytes = (entry: TapeEntryV1): number => dcMessageBytes(JSON.stringify
 
 /** Why the collator closes a tape channel. The code is stable: the peer reads it to tell a resync from a dead channel. */
 interface CloseReason {
-  code: 'resync_required' | 'stalled' | 'deadline_exceeded';
+  code: 'resync_required' | 'stalled' | 'deadline_exceeded' | 'busy_retry';
   msg: string;
 }
 
@@ -136,24 +136,29 @@ export class PeerSession {
 
   /**
    * Adopts the channel the peer just opened. A peer may open several channels on one connection;
-   * the previous one is closed here, so only one channel per session can hold state or memory.
-   * The new channel is unsubscribed until its own TAPE_SUB. A stream in flight cannot go on from the
-   * new channel: the peer's position was on the closed one, and entries held for it are not on the
-   * new channel. The new channel is closed as well, so the peer resubscribes on a fresh one from its
-   * own position.
+   * the previous one is closed here, so only one channel per session can hold state or memory. The
+   * new channel is unsubscribed until its own TAPE_SUB. A channel opened while a stream is in flight
+   * is refused with ERR busy_retry and closed, and returns false. The stream keeps its channel and
+   * ends on its own (it completes, stalls or passes its deadline), and the peer opens a channel again
+   * once it has ended.
    */
-  attachDataChannel(dc: RTCDataChannel): void {
+  attachDataChannel(dc: RTCDataChannel): boolean {
+    if (this.stream !== null) {
+      sendErrOn(dc, { code: 'busy_retry', msg: 'a replay is in flight on this connection; open the channel again when it ends' });
+      try {
+        dc.close();
+      } catch {}
+      return false;
+    }
     const previous = this.dc;
-    const interrupted = this.stream !== null;
     this.dc = dc;
-    this.stream = null;
     this.wantsTape = false;
     if (previous && previous !== dc) {
       try {
         previous.close();
       } catch {}
     }
-    if (interrupted) this.dropChannel();
+    return true;
   }
 
   /**
