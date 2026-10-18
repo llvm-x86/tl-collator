@@ -238,7 +238,9 @@ export class TapeStore {
       const decoder = new StringDecoder('utf8');
 
       while (filePos < st.size) {
-        const n = fs.readSync(fd, buf, 0, buf.length, filePos);
+        // Never read past the size taken above: lines appended after the replay began are the live
+        // feed's to deliver, and a full-size read would replay them too.
+        const n = fs.readSync(fd, buf, 0, Math.min(buf.length, st.size - filePos), filePos);
         if (n <= 0) break;
         filePos += n;
         const chunk = carry + decoder.write(buf.subarray(0, n));

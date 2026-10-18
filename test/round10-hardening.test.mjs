@@ -136,14 +136,16 @@ test('R10-REPLAY a large TAPE_SUB resync through a responsive channel is deliver
     const ch = fakeChannel();
     const session = new PeerSession({ id: 'p1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = ch;
-    const replay = await store.replayFromSeq(1, (e) => session.sendReplayEntry(ch, e));
+    await session.serveTapeSub(ch, store, 1);
     ch.stop();
     // The whole replay is far beyond the live-feed cap, so a burst without pacing could not pass.
     const total = ch.sent.reduce((n, s) => n + Buffer.byteLength(s), 0);
     assert.ok(total > DC_MAX_BUFFERED_BYTES, `fixture too small (${total} bytes) to exercise the cap`);
-    assert.equal(replay.lastSeq, count, 'replay stopped before the end');
+    const end = JSON.parse(ch.sent[ch.sent.length - 1]);
+    assert.equal(end.t, 'TAPE_END', 'replay stopped before the end');
+    assert.equal(end.lastSeq, count, 'replay stopped before the end');
     assert.equal(ch.closed, 0, 'a responsive channel was closed during resync');
-    assert.equal(ch.sent.length, count, `delivered ${ch.sent.length} of ${count} entries`);
+    assert.equal(ch.sent.length, count + 1, `delivered ${ch.sent.length - 1} of ${count} entries`);
     assert.equal(session.dc, ch, 'session lost its channel during resync');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -167,14 +169,18 @@ test('R10-REPLAY the unpaced burst (round 8 path) closes the same channel: the m
 });
 
 test('R10-REPLAY a stalled channel ends the replay and is closed (no hang)', { timeout: 20000 }, async () => {
-  const ch = { readyState: 'open', bufferedAmount: 2 * 1024 * 1024, sent: [], closed: 0, send() {}, close() { this.readyState = 'closed'; this.closed += 1; } };
-  const session = new PeerSession({ id: 'p2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
-  session.dc = ch;
-  const entry = { v: 1, seq: 1, order: {} };
-  const delivered = await session.sendReplayEntry(ch, entry, 200);
-  assert.equal(delivered, false);
-  assert.equal(ch.closed, 1, 'stalled channel was not closed');
-  assert.equal(session.dc, null);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r10-stall-'));
+  try {
+    const store = openStore(dir, writeTape(dir, 1, 10), 10000);
+    const ch = { readyState: 'open', bufferedAmount: 2 * 1024 * 1024, sent: [], closed: 0, send() {}, close() { this.readyState = 'closed'; this.closed += 1; } };
+    const session = new PeerSession({ id: 'p2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    session.dc = ch;
+    await session.serveTapeSub(ch, store, 1, 200);
+    assert.equal(ch.closed, 1, 'stalled channel was not closed');
+    assert.equal(session.dc, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('R10-REPLAY a replay stops when its channel is replaced by a newer one', async () => {
@@ -186,20 +192,17 @@ test('R10-REPLAY a replay stops when its channel is replaced by a newer one', as
     const fresh = fakeChannel();
     const session = new PeerSession({ id: 'p3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
     session.dc = old;
-    let n = 0;
-    let stopped = false;
-    await store.replayFromSeq(1, async (e) => {
-      n += 1;
-      if (n === 50) session.attachDataChannel(fresh);
-      const sent = await session.sendReplayEntry(old, e);
-      if (!sent) stopped = true;
-      return sent;
-    });
+    // The swap happens right after the 49th entry leaves the old channel.
+    const sendOld = old.send;
+    old.send = function (data) {
+      sendOld.call(this, data);
+      if (this.sent.length === 49) session.attachDataChannel(fresh);
+    };
+    await session.serveTapeSub(old, store, 1);
     old.stop();
     fresh.stop();
-    assert.equal(stopped, true, 'replay ran on after its channel was replaced');
     assert.equal(fresh.sent.length, 0, 'replaced channel delivered entries to the successor');
-    assert.equal(old.sent.length, 49);
+    assert.equal(old.sent.length, 49, 'replay ran on after its channel was replaced');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

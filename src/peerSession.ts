@@ -39,7 +39,19 @@ export function dcMessageBytes(data: string | ArrayBuffer | ArrayBufferView): nu
 /** A replay gives up on a channel whose queue has not shrunk for this long (a stalled peer). */
 export const DC_REPLAY_STALL_MS = 10_000;
 
+/**
+ * Live entries a session holds while its replay runs (round 12). A replay can be slow, and every
+ * SUBMIT commits meanwhile, so past this bound the channel is closed and the wallet resyncs.
+ */
+export const DC_REPLAY_MAX_HELD_ENTRIES = 4096;
+
 const DC_REPLAY_POLL_MS = 5;
+
+/** One TAPE_SUB replay on a session: the channel it writes to and the live entries it holds. */
+interface TapeReplay {
+  channel: RTCDataChannel;
+  held: TapeEntryV1[];
+}
 
 export class PeerSession {
   readonly id: string;
@@ -48,6 +60,9 @@ export class PeerSession {
 
   // If true, peer has requested tape feed (or we treat all as subscribers).
   wantsTape: boolean = false;
+
+  // The replay this session is serving, if any. While it is set, live entries wait in it.
+  private replay: TapeReplay | null = null;
 
   // SUBMIT rate limit (per-peer).
   submitBucket: TokenBucket;
@@ -119,33 +134,64 @@ export class PeerSession {
   }
 
   /**
-   * Serves a TAPE_SUB on `channel`: replays the tape from `fromSeq`, then sends TAPE_END. An
-   * interrupted replay sends no TAPE_END, since that would claim a tip the peer never received.
+   * Serves a TAPE_SUB on `channel` as one ordered stream: the replay from `fromSeq`, then the live
+   * entries committed while it ran, then TAPE_END. A newer TAPE_SUB on this session supersedes this
+   * one. A replay that is interrupted sends no TAPE_END, and the entries it held are dropped: the
+   * peer resubscribes on the next channel, and that replay covers them.
    */
   async serveTapeSub(channel: RTCDataChannel, tape: TapeStore, fromSeq: number, stallMs?: number): Promise<void> {
-    let interrupted = false;
-    const replay = await tape.replayFromSeq(fromSeq, async (e) => {
-      const sent = await this.sendReplayEntry(channel, e, stallMs);
-      if (!sent) interrupted = true;
-      return sent;
-    });
-    if (interrupted) return;
-    // `fromSeq` is the first seq actually replayed: it is greater than the requested one when the
-    // resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
-    this.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
+    const replay: TapeReplay = { channel, held: [] };
+    this.replay = replay;
+    try {
+      let open = true;
+      const range = await tape.replayFromSeq(fromSeq, async (e) => {
+        open = await this.sendReplayEntry(replay, e, stallMs);
+        return open;
+      });
+      while (open && replay.held.length > 0) {
+        open = await this.sendReplayEntry(replay, replay.held.shift()!, stallMs);
+      }
+      if (!open || !this.replayIsCurrent(replay)) return;
+      // Cleared and TAPE_END sent with no await in between: no live entry can slip in before the end marker.
+      this.replay = null;
+      // `fromSeq` is the first seq actually replayed: it is greater than the requested one when the
+      // resync was clamped to TAPE_RESYNC_MAX_ENTRIES. The tip is read here, after every entry up to
+      // it has been sent or held.
+      this.sendDc({ t: 'TAPE_END', v: 1, lastSeq: tape.getLastSeq(), fromSeq: range.fromSeq });
+    } finally {
+      if (this.replay === replay) this.replay = null;
+    }
   }
 
   /**
-   * Sends one replayed entry on `channel`, waiting for the queue to drain first. Returns false,
-   * and sends nothing more, once `channel` is no longer this session's channel or is closed. A
+   * Hands a live entry to this session: it is sent now, or held while a replay runs so that the
+   * channel carries the replay first and the held entries after it, in commit order.
+   */
+  deliverTapeEntry(entry: TapeEntryV1): void {
+    const replay = this.replay;
+    if (!replay) {
+      this.sendTapeEntry(entry);
+      return;
+    }
+    if (replay.held.length >= DC_REPLAY_MAX_HELD_ENTRIES) {
+      this.dropChannel();
+      return;
+    }
+    replay.held.push(entry);
+  }
+
+  /**
+   * Sends one replayed entry, waiting for the queue to drain first. Returns false, and sends nothing
+   * more, once the replay is superseded, its channel is no longer this session's or is closed. A
    * queue that does not shrink for `stallMs` closes the channel, so a stalled peer still ends the
    * replay.
    */
-  async sendReplayEntry(channel: RTCDataChannel, entry: TapeEntryV1, stallMs: number = DC_REPLAY_STALL_MS): Promise<boolean> {
+  private async sendReplayEntry(replay: TapeReplay, entry: TapeEntryV1, stallMs: number = DC_REPLAY_STALL_MS): Promise<boolean> {
+    const channel = replay.channel;
     let queued = channel.bufferedAmount;
     let progressAt = Date.now();
     while (channel.bufferedAmount > DC_REPLAY_HIGH_WATER_BYTES) {
-      if (this.dc !== channel || channel.readyState !== 'open') return false;
+      if (!this.replayIsCurrent(replay)) return false;
       await new Promise<void>((resolve) => setTimeout(resolve, DC_REPLAY_POLL_MS));
       if (channel.bufferedAmount < queued) {
         queued = channel.bufferedAmount;
@@ -155,8 +201,12 @@ export class PeerSession {
         return false;
       }
     }
-    if (this.dc !== channel || channel.readyState !== 'open') return false;
+    if (!this.replayIsCurrent(replay)) return false;
     return this.sendTapeEntry(entry);
+  }
+
+  private replayIsCurrent(replay: TapeReplay): boolean {
+    return this.replay === replay && this.dc === replay.channel && replay.channel.readyState === 'open';
   }
 
   private dropChannel(): void {
@@ -177,6 +227,6 @@ export function broadcastTapeEntry(peers: Iterable<PeerSession>, entry: TapeEntr
   for (const peer of peers) {
     if (!peer.dc || peer.dc.readyState !== 'open') continue;
     if (!peer.wantsTape) continue;
-    peer.sendTapeEntry(entry);
+    peer.deliverTapeEntry(entry);
   }
 }
