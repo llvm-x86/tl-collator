@@ -13,7 +13,6 @@ import { fileURLToPath } from 'node:url';
 
 import { DC_REPLAY_HIGH_WATER_BYTES, PeerSession, broadcastTapeEntry } from '../dist/peerSession.js';
 import { loadConfig } from '../dist/config.js';
-import * as peerSession from '../dist/peerSession.js';
 import { TapeStore } from '../dist/tape.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -115,8 +114,10 @@ test('R12-F1 live entries held past the bound close the channel and end the repl
     session.wantsTape = true;
     const served = session.serveTapeSub(ch, store, 1);
     await sleep(30);
-    for (let i = 0; i <= peerSession.DC_REPLAY_MAX_HELD_ENTRIES; i += 1) {
-      broadcastTapeEntry([session], store.append(orderFor(1000 + i)));
+    // Held entries are bounded by bytes (R13-3): about 400 KB each, so a few of them pass the bound.
+    const pad = 'x'.repeat(400 * 1024);
+    for (let i = 0; i < 16; i += 1) {
+      broadcastTapeEntry([session], store.append({ ...orderFor(1000 + i), body: { pad, i } }));
     }
     ch.bufferedAmount = 0;
     await served;

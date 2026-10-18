@@ -1241,10 +1241,7 @@ async function main() {
       // Single-run guard: 'error' is often followed by 'close'.
       if (!sessions.has(id)) return;
       teardowns.delete(sess);
-      try {
-        sess.dc?.close();
-      } catch {}
-      sess.dc = null;
+      sess.dropChannel();
       try {
         pc?.close?.();
       } catch {}
@@ -1296,10 +1293,7 @@ async function main() {
           // H3a: close/replace any previous peer connection for this session;
           // otherwise a client looping offers leaks native WebRTC/ICE resources.
           if (pc || sess.dc) {
-            try {
-              sess.dc?.close();
-            } catch {}
-            sess.dc = null;
+            sess.dropChannel();
             try {
               pc?.close?.();
             } catch {}
@@ -1429,7 +1423,7 @@ async function main() {
                   // Register the live subscription first: the rate limit below
                   // only guards the full tape *replay* — returning early must
                   // never silently drop the client's live feed.
-                  sess.wantsTape = true;
+                  if (sess.dc === dc) sess.wantsTape = true;
                   // H3c: rate-limit full tape re-reads per client IP (not per session).
                   if (!tapeResyncGate.allow(ipKey)) {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed' });
@@ -1494,7 +1488,7 @@ async function main() {
             dc.onclose = () => {
               // Only the channel the session currently holds. A replaced channel closes after
               // its successor is attached, and must not detach the successor.
-              if (sess.dc === dc) sess.dc = null;
+              if (sess.dc === dc) sess.dropChannel();
             };
           };
 
