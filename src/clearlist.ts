@@ -43,8 +43,10 @@ export class ClearlistClient {
     );
     if (!r.ok) throw new Error(`clearlist http ${r.status}`);
     const j: any = r.body;
+    // Only a boolean admits or refuses. Any other answer is an error, so CLEARLIST_FAIL_MODE decides (round 12 / F3).
+    if (typeof j?.allowed !== 'boolean') throw new Error('clearlist answer has no boolean "allowed"');
     const v: ClearlistResult = {
-      allowed: !!j.allowed,
+      allowed: j.allowed,
       snapshotId: j.snapshotId ? String(j.snapshotId) : undefined,
       expTs: typeof j.expTs === 'number' ? j.expTs : undefined,
     };

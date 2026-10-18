@@ -225,3 +225,41 @@ test('R12-F2 /attestation/ip with a configured intel provider still reports its 
     await intel.close();
   }
 });
+
+// ------------------------------------------------------- clearlist answers (F3)
+
+// A loopback clearlist oracle that answers every check with `body`.
+async function startClearlistStub(body) {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+test('R12-F3 a clearlist answer admits only a boolean true', { timeout: 60000 }, async () => {
+  const { ClearlistClient } = await import('../dist/clearlist.js');
+  const cases = [
+    [{ allowed: true }, true],
+    [{ allowed: false }, false],
+    [{ allowed: 'false' }, 'refused'],
+    [{ allowed: 'true' }, 'refused'],
+    [{ allowed: 0 }, 'refused'],
+    [{ allowed: 1 }, 'refused'],
+    [{}, 'refused'],
+  ];
+  for (const [body, want] of cases) {
+    const stub = await startClearlistStub(body);
+    try {
+      const client = new ClearlistClient({ baseUrl: stub.url });
+      const got = await client.check('group-1', 'ab'.repeat(33)).then((r) => r.allowed, () => 'refused');
+      assert.equal(got, want, `clearlist answer ${JSON.stringify(body)} was read as ${JSON.stringify(got)}`);
+    } finally {
+      await stub.close();
+    }
+  }
+});
