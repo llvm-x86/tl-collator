@@ -1,5 +1,6 @@
 import type { WebSocket } from 'ws';
 import type { TapeEntryV1, WireMsg } from './types.js';
+import type { TapeStore } from './tape.js';
 import { TokenBucket, type KeyedTokenBuckets } from './ratelimit.js';
 
 export interface SessionMetaV1 {
@@ -115,6 +116,23 @@ export class PeerSession {
 
   sendTapeEntry(entry: TapeEntryV1): boolean {
     return this.sendDc({ t: 'TAPE_ENTRY', v: 1, entry });
+  }
+
+  /**
+   * Serves a TAPE_SUB on `channel`: replays the tape from `fromSeq`, then sends TAPE_END. An
+   * interrupted replay sends no TAPE_END, since that would claim a tip the peer never received.
+   */
+  async serveTapeSub(channel: RTCDataChannel, tape: TapeStore, fromSeq: number, stallMs?: number): Promise<void> {
+    let interrupted = false;
+    const replay = await tape.replayFromSeq(fromSeq, async (e) => {
+      const sent = await this.sendReplayEntry(channel, e, stallMs);
+      if (!sent) interrupted = true;
+      return sent;
+    });
+    if (interrupted) return;
+    // `fromSeq` is the first seq actually replayed: it is greater than the requested one when the
+    // resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
+    this.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
   }
 
   /**

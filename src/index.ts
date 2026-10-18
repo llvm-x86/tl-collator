@@ -1430,20 +1430,7 @@ async function main() {
                     return;
                   }
                   const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
-                  // Paced on this channel: the replay waits for the queue to drain and stops if the
-                  // channel is replaced or closed (round 10).
-                  let interrupted = false;
-                  const replay = await tape.replayFromSeq(Math.max(1, fromSeq), async (e) => {
-                    const sent = await sess.sendReplayEntry(dc, e);
-                    if (!sent) interrupted = true;
-                    return sent;
-                  });
-                  // An interrupted replay has no end marker: TAPE_END would claim a tip the peer never received.
-                  if (interrupted) return;
-                  // Optional end marker; wallets that don't understand it should ignore.
-                  // `fromSeq` is the first seq actually replayed: it is greater than the
-                  // requested one when the resync was clamped to TAPE_RESYNC_MAX_ENTRIES.
-                  sess.sendDc({ t: 'TAPE_END', v: 1, lastSeq: replay.lastSeq, fromSeq: replay.fromSeq });
+                  await sess.serveTapeSub(dc, tape, Math.max(1, fromSeq));
                   return;
                 }
 
