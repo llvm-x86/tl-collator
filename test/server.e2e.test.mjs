@@ -458,7 +458,8 @@ async function openDataPeer(port) {
   });
   ws.send(JSON.stringify({ t: 'SIGNAL_OFFER', v: 1, kind: 'offer', sdp: 'fake-offer' }));
   await waitUntil(() => peer.answered, 5000, 'SIGNAL_ANSWER');
-  peer.send = (msg) => ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: `in:${JSON.stringify(msg)}` } }));
+  peer.sendRaw = (text) => ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: `in:${text}` } }));
+  peer.send = (msg) => peer.sendRaw(JSON.stringify(msg));
   return peer;
 }
 
@@ -507,6 +508,30 @@ test('R15-1 a TAPE_SUB refused by the per-IP gate leaves its channel unsubscribe
     await new Promise((r) => setTimeout(r, 200));
     assert.deepEqual(tapeEntries(b), [], 'B received live entries after its refused TAPE_SUB, with seqs 1..2 never sent to it');
     assert.deepEqual(b.wire.map((m) => m.t), ['ERR'], 'B carried more than the refusal');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('R15-2 a TAPE_SUB whose fromSeq is not a non-negative safe integer is refused with ERR bad_request and replays nothing', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    const a = await openDataPeer(c.port);
+    const bad = [
+      '{"t":"TAPE_SUB","v":1,"fromSeq":-1}',
+      '{"t":"TAPE_SUB","v":1,"fromSeq":"5"}',
+      '{"t":"TAPE_SUB","v":1,"fromSeq":null}',
+      '{"t":"TAPE_SUB","v":1,"fromSeq":1.5}',
+      '{"t":"TAPE_SUB","v":1,"fromSeq":1e400}',
+      '{"t":"TAPE_SUB","v":1,"fromSeq":9007199254740992}',
+    ];
+    for (const raw of bad) a.sendRaw(raw);
+    await waitUntil(() => a.wire.length === bad.length, 5000, 'a reply to each bad TAPE_SUB');
+    assert.deepEqual(a.wire.map((m) => (m.t === 'ERR' ? m.code : m.t)), bad.map(() => 'bad_request'), 'a bad fromSeq was not refused as bad_request');
+    // Zero is a valid fromSeq: it starts at seq 1. The refusals above never reached the rate gate.
+    a.send({ t: 'TAPE_SUB', v: 1, fromSeq: 0 });
+    await waitUntil(() => a.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END for fromSeq 0');
+    assert.equal(a.wire.at(-1).fromSeq, 1);
   } finally {
     await c.stop();
   }

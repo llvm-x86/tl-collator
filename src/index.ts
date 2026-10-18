@@ -1330,8 +1330,9 @@ async function main() {
                 const wm = safeJsonParse(txt) as WireMsg | null;
                 if (!wm || !isWireMsg(wm)) return;
                 sess.meta.lastSeenTs = Date.now();
-                if (!schemas.validateWireMsg(wm)) {
-                  sess.sendDc({ t: 'ERR', v: 1, code: 'SCHEMA_INVALID', msg: 'invalid WireMsg schema' });
+                const refusal = schemas.wireRefusal(wm);
+                if (refusal) {
+                  sess.sendDc({ t: 'ERR', v: 1, ...refusal });
                   return;
                 }
 
@@ -1426,8 +1427,8 @@ async function main() {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second' });
                     return;
                   }
-                  const fromSeq = typeof wm.fromSeq === 'number' ? wm.fromSeq : 1;
-                  await sess.serveTapeSub(dc, tape, Math.max(1, fromSeq));
+                  // Validated by wireRefusal: absent or a non-negative safe integer. Seq 0 starts at 1.
+                  await sess.serveTapeSub(dc, tape, Math.max(1, wm.fromSeq ?? 1));
                   return;
                 }
 
