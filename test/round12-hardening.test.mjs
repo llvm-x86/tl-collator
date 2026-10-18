@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DC_REPLAY_HIGH_WATER_BYTES, PeerSession, broadcastTapeEntry } from '../dist/peerSession.js';
+import { loadConfig } from '../dist/config.js';
 import * as peerSession from '../dist/peerSession.js';
 import { TapeStore } from '../dist/tape.js';
 
@@ -302,4 +303,31 @@ test('R12-F5 the X-Forwarded-For client IP rule matches the shared vectors', asy
     if (got !== c.expect) failures.push(`${c.name}: got ${JSON.stringify(got)}, want ${JSON.stringify(c.expect)}`);
   }
   assert.deepEqual(failures, [], 'client IP rule disagrees with the shared vectors');
+});
+
+// ------------------------------------------------------- ICE server config (F8)
+
+// Same shape as test/config.test.js: loadConfig reads process.env at call time.
+const withConfigEnv = (overrides, fn) => {
+  const saved = { ...process.env };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r12-config-'));
+  try {
+    Object.assign(process.env, { DATA_DIR: dir, TRUST_PROXY: '', TRUST_PROXY_CIDRS: '' }, overrides);
+    return fn();
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+test('R12-F8 an ICE_SERVERS_JSON that is not a JSON array aborts startup instead of silently using Google STUN', () => {
+  for (const bad of ['[{"urls":', '{"urls":"stun:stun.example.org:3478"}', '"stun:stun.example.org"']) {
+    withConfigEnv({ ICE_SERVERS_JSON: bad }, () => {
+      assert.throws(() => loadConfig(), /ICE_SERVERS_JSON/, `accepted ICE_SERVERS_JSON=${bad}`);
+    });
+  }
+  withConfigEnv({ ICE_SERVERS_JSON: '[{"urls":["stun:stun.example.org:3478"]}]' }, () => {
+    assert.deepEqual(loadConfig().iceServers, [{ urls: ['stun:stun.example.org:3478'] }]);
+  });
 });

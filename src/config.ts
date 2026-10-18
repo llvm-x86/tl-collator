@@ -122,12 +122,13 @@ export function loadConfig(): Config {
   const iceJson =
     process.env.ICE_SERVERS_JSON ||
     JSON.stringify([{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]);
-  let iceServers: RTCIceServer[] = [];
+  // A value that is set but not a JSON array refuses startup (round 12 / F8); it is never replaced by the defaults.
+  let iceParsed: unknown = null;
   try {
-    iceServers = JSON.parse(iceJson);
-  } catch {
-    iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
-  }
+    iceParsed = JSON.parse(iceJson);
+  } catch {}
+  if (!Array.isArray(iceParsed)) throw new Error('ICE_SERVERS_JSON must be a JSON array of ICE server objects');
+  const iceServers = iceParsed as RTCIceServer[];
 
   fs.mkdirSync(dataDir, { recursive: true });
 
