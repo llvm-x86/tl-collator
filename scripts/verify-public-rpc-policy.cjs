@@ -38,6 +38,7 @@ const collator = codeOnly(fs.readFileSync(collatorPath, 'utf8'));
 const canonical = codeOnly(fs.readFileSync(canonicalPath, 'utf8'));
 const clientIpSrc = codeOnly(fs.readFileSync(clientIpPath, 'utf8'));
 const admissionSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'orderAdmission.ts'), 'utf8'));
+const peerSessionSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'peerSession.ts'), 'utf8'));
 const configSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'config.ts'), 'utf8'));
 const schemaSrc = codeOnly(fs.readFileSync(schemaPath, 'utf8'));
 const orderSchema = fs.readFileSync(orderSchemaPath, 'utf8');
@@ -118,8 +119,8 @@ for (const needle of [
   "'validateaddress'",
   "'listunspent'",
   "'decoderawtransaction'",
-  'sess.wantsTape = true;',
-  "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; live feed stays subscribed'",
+  "if (!sess.openBucket.allow(1)) {",
+  "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second'",
   'for (const key of admissionKeys) rpcAdmission.acquire(key);',
   "const tapeResyncGate = new MinIntervalGate(",
   // Limiter identity (one key for every per-client budget): IPv6 collapses to its
@@ -214,6 +215,11 @@ for (const [name, text] of [['collator', collator], ['canonical', canonical], ['
   if (/(?<![.\w])(?:message|msg|error)\s*:\s*(?:e|err)\??\.message|(?<![.\w])(?:message|msg|error)\s*:\s*String\((?:e|err)\)/.test(text)) {
     throw new Error(`${name}: caught error text is returned to a peer`);
   }
+}
+
+// A served TAPE_SUB is the only thing that subscribes a channel (peerSession.ts).
+for (const needle of ['this.wantsTape = true;', 'if (this.stream !== null) {']) {
+  if (!peerSessionSrc.includes(needle)) throw new Error(`Session policy missing: ${needle}`);
 }
 
 // Integer env vars go through the single strict parser (config.ts intEnv).
