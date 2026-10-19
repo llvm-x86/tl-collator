@@ -123,10 +123,11 @@ for (const needle of [
   "'validateaddress'",
   "'listunspent'",
   "'decoderawtransaction'",
-  "if (!sess.openBucket.allow(1)) {",
+  "if (!sess.admitOpen(openClientBuckets, ipKey)) {",
+  "if (!sess.admitTapeSub(openClientBuckets, ipKey)) {",
   "code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second'",
   'for (const key of admissionKeys) rpcAdmission.acquire(key);',
-  "const tapeResyncGate = new MinIntervalGate(",
+  "const openClientBuckets = new KeyedTokenBuckets({",
   // Limiter identity (one key for every per-client budget): IPv6 collapses to its
   // prefix, and the HTTP table is bounded and never resets a client on eviction.
   "const clientKey = (ip: string): string => clientKeyForIp(ip, cfg.clientIpv6PrefixLen);",
@@ -222,7 +223,7 @@ for (const [name, text] of [['collator', collator], ['canonical', canonical], ['
 }
 
 // A served TAPE_SUB is the only thing that subscribes a channel (peerSession.ts).
-for (const needle of ['this.wantsTape = true;', 'if (this.stream !== null) {']) {
+for (const needle of ['this.wantsTape = true;', 'if (this.stream !== null) {', 'if (now - this.lastTapeSubMs < TAPE_SUB_MIN_INTERVAL_MS) return false;', 'if (!this.admitOpen(clients, clientKey)) return false;']) {
   if (!peerSessionSrc.includes(needle)) throw new Error(`Session policy missing: ${needle}`);
 }
 

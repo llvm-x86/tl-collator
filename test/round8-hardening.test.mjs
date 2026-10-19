@@ -49,7 +49,7 @@ const fakeDc = ({ bufferedAmount = 0, throwOnSend = false } = {}) => {
 const fakeWs = { readyState: 1, OPEN: 1, close() {} };
 
 const sessionWith = (dc) => {
-  const s = new PeerSession({ id: `p-${Math.random()}`, ws: fakeWs, burst: 10, ratePerSec: 1 });
+  const s = new PeerSession({ id: `p-${Math.random()}`, ws: fakeWs, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
   s.dc = dc;
   return s;
 };

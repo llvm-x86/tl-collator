@@ -119,7 +119,7 @@ async function runSchedule(seed) {
   const label = `seed ${seed}`;
   try {
     const store = openStore(dir);
-    const session = new PeerSession({ id: `prop-${seed}`, ws: { readyState: 1 }, burst: 1000, ratePerSec: 1000 });
+    const session = new PeerSession({ id: `prop-${seed}`, ws: { readyState: 1 }, burst: 1000, ratePerSec: 1000, openBurst: 4, openRatePerSec: 3 });
     const channels = [];
     const commits = [];
     const serves = [];
@@ -206,7 +206,7 @@ test('R13-1 a superseding TAPE_SUB continues the channel after the seqs it alrea
     const store = openStore(dir);
     for (let i = 1; i <= 300; i += 1) store.append(orderFor(i));
     const ch = makeChannel({ parkAfter: 50 });
-    const session = new PeerSession({ id: 'r13-1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r13-1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     const first = session.serveTapeSub(ch, store, 1);
     while (tapeSeqs(ch.msgs).length < 50) await sleep(2);
@@ -230,7 +230,7 @@ test('R13-2 a channel attached while a replay is in flight is refused with ERR b
     for (let i = 1; i <= 20; i += 1) store.append(orderFor(i));
     const a = makeChannel();
     a.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
-    const session = new PeerSession({ id: 'r13-2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r13-2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(a);
     const served = session.serveTapeSub(a, store, 1);
     await sleep(20);
@@ -260,7 +260,7 @@ test('R17-F3 the busy_retry answer tells the peer to wait 1 s before its TAPE_SU
     for (let i = 1; i <= 20; i += 1) store.append(orderFor(i));
     const a = makeChannel();
     a.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
-    const session = new PeerSession({ id: 'r17-3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r17-3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(a);
     const served = session.serveTapeSub(a, store, 1);
     await sleep(20);
@@ -288,7 +288,7 @@ test('R13-4 a replay past its deadline ends with the channel closed and no TAPE_
     const drain = setInterval(() => {
       ch.bufferedAmount = Math.max(0, ch.bufferedAmount - 50);
     }, 1);
-    const session = new PeerSession({ id: 'r13-4', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r13-4', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     const started = Date.now();
     await session.serveTapeSub(ch, store, 1, { stallMs: 60_000, deadlineMs: 300 });
@@ -310,7 +310,7 @@ test('R15-3 a TAPE_SUB below the channel run closes the channel after an ERR res
     for (let i = 1; i <= 30; i += 1) store.append(orderFor(i));
     // A replay from 10 is parked after three entries: the run this channel carries is 10..12.
     const ch = makeChannel({ parkAfter: 3 });
-    const session = new PeerSession({ id: 'r15-3-below', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r15-3-below', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(ch);
     const first = session.serveTapeSub(ch, store, 10, { stallMs: 60_000, deadlineMs: 60_000 });
     while (tapeSeqs(ch.msgs).length < 3) await sleep(2);
@@ -332,7 +332,7 @@ test('R15-3 a replay whose peer stops draining closes the channel after an ERR s
     const store = openStore(dir);
     for (let i = 1; i <= 30; i += 1) store.append(orderFor(i));
     const ch = makeChannel({ parkAfter: 3 });
-    const session = new PeerSession({ id: 'r15-3-stall', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r15-3-stall', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(ch);
     await session.serveTapeSub(ch, store, 1, { stallMs: 50, deadlineMs: 60000 });
     assert.equal(ch.closed, 1, 'a stalled replay kept its channel');
@@ -353,7 +353,7 @@ test('R15-3 a replay past its deadline closes the channel after an ERR deadline_
     const drain = setInterval(() => {
       ch.bufferedAmount = Math.max(0, ch.bufferedAmount - 50);
     }, 1);
-    const session = new PeerSession({ id: 'r15-3-deadline', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'r15-3-deadline', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(ch);
     await session.serveTapeSub(ch, store, 1, { stallMs: 60_000, deadlineMs: 300 });
     clearInterval(drain);

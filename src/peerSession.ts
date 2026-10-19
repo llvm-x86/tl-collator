@@ -3,6 +3,9 @@ import type { TapeEntryV1, WireMsg } from './types.js';
 import type { TapeStore } from './tape.js';
 import { TokenBucket, type KeyedTokenBuckets } from './ratelimit.js';
 
+// Minimum interval between two TAPE_SUB replays admitted on one session (H3c, now per session).
+const TAPE_SUB_MIN_INTERVAL_MS = 1000;
+
 export interface SessionMetaV1 {
   remoteIp?: string;
   userAgent?: string;
@@ -115,17 +118,28 @@ export class PeerSession {
   // SUBMIT rate limit (per-peer).
   submitBucket: TokenBucket;
 
-  // Pacing for native objects a peer can make the collator build: each accepted SIGNAL_OFFER builds a
-  // peer connection, and each channel open (adopted or refused) builds a channel. One budget for both,
-  // so a small burst covers a reconnect and the rest is refused.
-  openBucket: TokenBucket = new TokenBucket({ capacity: 3, refillPerSec: 1 });
+  // The session's share of the open budget (see admitOpen).
+  private openBucket: TokenBucket;
+
+  // When this session's last served TAPE_SUB was admitted (see admitTapeSub).
+  private lastTapeSubMs = -Infinity;
 
   meta: SessionMetaV1;
 
-  constructor(opts: { id: string; ws: WebSocket; burst: number; ratePerSec: number; remoteIp?: string; userAgent?: string }) {
+  constructor(opts: {
+    id: string;
+    ws: WebSocket;
+    burst: number;
+    ratePerSec: number;
+    openBurst: number;
+    openRatePerSec: number;
+    remoteIp?: string;
+    userAgent?: string;
+  }) {
     this.id = opts.id;
     this.ws = opts.ws;
     this.submitBucket = new TokenBucket({ capacity: opts.burst, refillPerSec: opts.ratePerSec });
+    this.openBucket = new TokenBucket({ capacity: opts.openBurst, refillPerSec: opts.openRatePerSec });
     const now = Date.now();
     this.meta = {
       remoteIp: opts.remoteIp,
@@ -141,6 +155,29 @@ export class PeerSession {
    */
   admitSubmit(clients: KeyedTokenBuckets, clientKey: string): boolean {
     return this.submitBucket.allow(1) && clients.take(clientKey).allowed;
+  }
+
+  /**
+   * Charges one open to this session and to its client key. An open is a SIGNAL_OFFER (a peer connection
+   * built), a channel open (adopted or refused) or a TAPE_SUB. The session bucket bounds one session; the
+   * client bucket bounds the sum over every session of that client, so opening sessions does not multiply
+   * the budget.
+   */
+  admitOpen(clients: KeyedTokenBuckets, clientKey: string): boolean {
+    return this.openBucket.allow(1) && clients.take(clientKey).allowed;
+  }
+
+  /**
+   * Admits a TAPE_SUB as an open, and also refuses one that comes less than TAPE_SUB_MIN_INTERVAL_MS after
+   * this session's last served TAPE_SUB, whatever the budget holds: a token bucket alone would admit a
+   * second TAPE_SUB on a session that has tokens left. A request refused by the spacing charges nothing.
+   */
+  admitTapeSub(clients: KeyedTokenBuckets, clientKey: string): boolean {
+    const now = Date.now();
+    if (now - this.lastTapeSubMs < TAPE_SUB_MIN_INTERVAL_MS) return false;
+    if (!this.admitOpen(clients, clientKey)) return false;
+    this.lastTapeSubMs = now;
+    return true;
   }
 
   /**

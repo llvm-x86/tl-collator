@@ -504,27 +504,30 @@ function signedOrder(n, body = {}) {
   return { ...env, orderId, sigTrader: signWithPrivKeyHex(orderId, traderPriv) };
 }
 
-test('R15-1 a TAPE_SUB refused by the per-IP gate leaves its channel unsubscribed: no live entry reaches it without a backfill', { timeout: 60000 }, async () => {
+test('R15-1 a second TAPE_SUB on a session inside the window is refused: its channel stays unsubscribed and no live entry reaches it without a backfill', { timeout: 60000 }, async () => {
   const c = await startCollator({ TL_E2E_WRTC: 'fake' });
   try {
-    // A is served: its replay of the empty tape starts the one-per-second window for this IP.
-    const a = await openDataPeer(c.port);
-    a.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
-    await waitUntil(() => a.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on A');
-    // B reconnects inside that window and asks for seqs from 3. The gate refuses it.
-    const b = await openDataPeer(c.port);
-    b.send({ t: 'TAPE_SUB', v: 1, fromSeq: 3 });
-    await waitUntil(() => b.wire.some((m) => m.t === 'ERR'), 5000, 'an ERR on B');
-    assert.deepEqual(b.wire.map((m) => m.t === 'ERR' ? m.code : m.t), ['rate_limited'], 'B was not refused by the gate');
-    // Two entries commit on A, the subscribed channel. Then one more.
-    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(1) });
-    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(2) });
-    await waitUntil(() => tapeEntries(a).length === 2, 5000, 'two live entries on A');
-    a.send({ t: 'SUBMIT', v: 1, order: signedOrder(3) });
-    await waitUntil(() => tapeEntries(a).length === 3, 5000, 'a third live entry on A');
+    // S is served on its first channel, which starts the one-per-second window for S.
+    const s = await openDataPeer(c.port);
+    s.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => s.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on S');
+    // S opens a second channel inside the window and asks for seqs from 3. The window refuses it.
+    s.ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: 'open' } }));
+    const mark = s.wire.length;
+    s.send({ t: 'TAPE_SUB', v: 1, fromSeq: 3 });
+    await waitUntil(() => s.wire.length > mark, 5000, 'a reply to the second TAPE_SUB');
+    const second = s.wire.slice(mark);
+    assert.deepEqual(second.map((m) => m.t === 'ERR' ? m.code : m.t), ['rate_limited'], 'the second TAPE_SUB was not refused');
+    // C is a third session on the same IP. Its own TAPE_SUB is served, and it receives the live entries.
+    const c2 = await openDataPeer(c.port);
+    c2.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => c2.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on C');
+    for (let n = 1; n <= 3; n += 1) {
+      c2.send({ t: 'SUBMIT', v: 1, order: signedOrder(n) });
+      await waitUntil(() => tapeEntries(c2).length === n, 5000, `live entry ${n} on C`);
+    }
     await new Promise((r) => setTimeout(r, 200));
-    assert.deepEqual(tapeEntries(b), [], 'B received live entries after its refused TAPE_SUB, with seqs 1..2 never sent to it');
-    assert.deepEqual(b.wire.map((m) => m.t), ['ERR'], 'B carried more than the refusal');
+    assert.deepEqual(s.wire.slice(mark).filter((m) => m.t === 'TAPE_ENTRY'), [], 'S received live entries on its refused channel, with seqs 1..3 never sent to it');
   } finally {
     await c.stop();
   }
@@ -573,6 +576,135 @@ test('R15-5 a SUBMIT whose number is written with digits its value does not show
     // The same order written as the integer is admitted: the channel is alive and the refusal was the number.
     a.send({ t: 'SUBMIT', v: 1, order });
     await waitUntil(() => tapeEntries(a).length === 1, 5000, 'the honest SUBMIT on A');
+  } finally {
+    await c.stop();
+  }
+});
+
+// Admission budget (opens and TAPE_SUB, one family, two scopes). The honest design point for the IP
+// scope is N = 8 tabs behind one NAT; each honest connect is an offer, a channel and a TAPE_SUB.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const onOpen = (ws) => new Promise((resolve, reject) => {
+  ws.once('open', resolve);
+  ws.once('error', reject);
+});
+// Every message the collator sends on a signalling socket: SIGNAL_* messages in `signal`, and the
+// DataChannel messages (SIGNAL_ICE "out:" candidates) parsed back to wire messages in `dc`.
+function recordSocket(ws) {
+  const rec = { signal: [], dc: [] };
+  ws.on('message', (d) => {
+    const m = JSON.parse(d.toString());
+    const text = m.t === 'SIGNAL_ICE' ? String(m.candidate?.candidate ?? '') : '';
+    if (text.startsWith('out:')) rec.dc.push(JSON.parse(text.slice(4)));
+    else rec.signal.push(m);
+  });
+  return rec;
+}
+const refusalCodes = (rec) => [
+  ...rec.signal.filter((m) => m.t === 'SIGNAL_ERR').map((m) => m.code),
+  ...rec.dc.filter((m) => m.t === 'ERR').map((m) => m.code),
+];
+const offerText = JSON.stringify({ t: 'SIGNAL_OFFER', v: 1, kind: 'offer', sdp: 'fake-offer' });
+const sendOnChannel = (ws, msg) => ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: `in:${JSON.stringify(msg)}` } }));
+
+test('FIX-OPEN-1 an honest reconnect once a second on one session is never refused, for 30 seconds', { timeout: 90000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  const ws = new WebSocket(`ws://127.0.0.1:${c.port}/ws`);
+  const rec = recordSocket(ws);
+  try {
+    await onOpen(ws);
+    for (let i = 1; i <= 30; i += 1) {
+      ws.send(offerText);
+      await waitUntil(() => refusalCodes(rec).length > 0 || rec.signal.filter((m) => m.t === 'SIGNAL_ANSWER').length === i, 5000, `answer ${i}`);
+      sendOnChannel(ws, { t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+      await waitUntil(() => refusalCodes(rec).length > 0 || rec.dc.filter((m) => m.t === 'TAPE_END').length === i, 5000, `TAPE_END ${i}`);
+      assert.deepEqual(refusalCodes(rec), [], `reconnect ${i} was refused`);
+      await sleep(1000);
+    }
+    assert.equal(rec.dc.filter((m) => m.t === 'TAPE_END').length, 30);
+  } finally {
+    ws.close();
+    await c.stop();
+  }
+});
+
+test('FIX-OPEN-2 eight sessions behind one IP each connect and make their first TAPE_SUB: none is refused', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    const peers = await Promise.all(Array.from({ length: 8 }, () => openDataPeer(c.port)));
+    for (const p of peers) p.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => peers.every((p) => p.wire.some((m) => m.t === 'TAPE_END' || m.t === 'ERR')), 5000, 'a reply to each first TAPE_SUB');
+    assert.deepEqual(peers.map((p) => p.wire.filter((m) => m.t === 'ERR').map((m) => m.code)), peers.map(() => []), 'a first TAPE_SUB was refused');
+    assert.ok(peers.every((p) => p.wire.some((m) => m.t === 'TAPE_END')), 'a first TAPE_SUB was not served');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('FIX-OPEN-3 a hostile session flooding offers is refused beyond its budget, and admits no more than its burst plus refill', { timeout: 60000 }, async () => {
+  const c = await startCollator({});
+  const ws = new WebSocket(`ws://127.0.0.1:${c.port}/ws`);
+  const rec = recordSocket(ws);
+  try {
+    await onOpen(ws);
+    const offers = 150;
+    const start = Date.now();
+    for (let i = 0; i < offers; i += 1) {
+      ws.send(offerText);
+      await sleep(20);
+    }
+    await waitUntil(() => rec.signal.length === offers, 10000, 'a reply to each offer');
+    const elapsedS = (Date.now() - start) / 1000;
+    // The stub cannot build a peer connection, so an admitted offer is answered SIGNAL_ERR internal.
+    const refused = rec.signal.filter((m) => m.code === 'rate_limited').length;
+    const admitted = offers - refused;
+    assert.ok(refused > 0, 'no offer was refused');
+    // Session burst 4 plus session refill 3 per second (OPEN_SESSION_BURST, OPEN_SESSION_RPS).
+    assert.ok(admitted <= 4 + 3 * elapsedS + 1, `${admitted} offers admitted in ${elapsedS.toFixed(1)} s`);
+  } finally {
+    ws.close();
+    await c.stop();
+  }
+});
+
+test('FIX-OPEN-4 fifty sessions behind one IP flooding offers are held to one IP budget, not to fifty session budgets', { timeout: 60000 }, async () => {
+  const c = await startCollator({ CONN_MAX_PER_IP: '64' });
+  const socks = [];
+  try {
+    for (let i = 0; i < 50; i += 1) {
+      const ws = new WebSocket(`ws://127.0.0.1:${c.port}/ws`);
+      socks.push({ ws, rec: recordSocket(ws) });
+    }
+    await Promise.all(socks.map((s) => onOpen(s.ws)));
+    const start = Date.now();
+    for (const s of socks) {
+      for (let i = 0; i < 10; i += 1) s.ws.send(offerText);
+    }
+    await waitUntil(() => socks.every((s) => s.rec.signal.length === 10), 15000, 'a reply to each offer');
+    const elapsedS = (Date.now() - start) / 1000;
+    const admitted = socks.reduce((n, s) => n + s.rec.signal.filter((m) => m.code !== 'rate_limited').length, 0);
+    // IP burst 32 plus IP refill 24 per second (OPEN_IP_BURST, OPEN_IP_RPS): 8 sessions of the session budget.
+    assert.ok(admitted <= 32 + 24 * elapsedS + 1, `${admitted} offers admitted from one IP in ${elapsedS.toFixed(1)} s`);
+    assert.ok(admitted >= 32, `only ${admitted} offers admitted from one IP`);
+  } finally {
+    for (const s of socks) s.ws.close();
+    await c.stop();
+  }
+});
+
+test('FIX-OPEN-5 a second TAPE_SUB on one session inside 1 s is refused while the session still holds budget', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    // The offer and its channel take two units, the first TAPE_SUB a third: one unit is left, so only the
+    // spacing rule can refuse the second TAPE_SUB on the same channel.
+    const s = await openDataPeer(c.port);
+    s.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => s.wire.some((m) => m.t === 'TAPE_END'), 5000, 'TAPE_END on the first TAPE_SUB');
+    const mark = s.wire.length;
+    s.send({ t: 'TAPE_SUB', v: 1, fromSeq: 1 });
+    await waitUntil(() => s.wire.length > mark, 5000, 'a reply to the second TAPE_SUB');
+    assert.deepEqual(s.wire.slice(mark).map((m) => m.t === 'ERR' ? m.code : m.t), ['rate_limited']);
   } finally {
     await c.stop();
   }

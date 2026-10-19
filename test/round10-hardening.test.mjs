@@ -134,7 +134,7 @@ test('R10-REPLAY a large TAPE_SUB resync through a responsive channel is deliver
     const tapePath = writeTape(dir, count, 600);
     const store = openStore(dir, tapePath, 10000);
     const ch = fakeChannel();
-    const session = new PeerSession({ id: 'p1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'p1', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     await session.serveTapeSub(ch, store, 1);
     ch.stop();
@@ -158,7 +158,7 @@ test('R10-REPLAY the unpaced burst (round 8 path) closes the same channel: the m
     const tapePath = writeTape(dir, 7000, 600);
     const store = openStore(dir, tapePath, 10000);
     const ch = fakeChannel();
-    const session = new PeerSession({ id: 'p0', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'p0', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     await store.replayFromSeq(1, (e) => session.sendTapeEntry(e));
     ch.stop();
@@ -173,7 +173,7 @@ test('R10-REPLAY a stalled channel ends the replay and is closed (no hang)', { t
   try {
     const store = openStore(dir, writeTape(dir, 1, 10), 10000);
     const ch = { readyState: 'open', bufferedAmount: 2 * 1024 * 1024, sent: [], closed: 0, send() {}, close() { this.readyState = 'closed'; this.closed += 1; } };
-    const session = new PeerSession({ id: 'p2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'p2', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     await session.serveTapeSub(ch, store, 1, 200);
     assert.equal(ch.closed, 1, 'stalled channel was not closed');
@@ -190,7 +190,7 @@ test('R10-REPLAY a channel attached while a replay runs is refused with busy_ret
     const store = openStore(dir, tapePath, 10000);
     const old = fakeChannel();
     const fresh = fakeChannel();
-    const session = new PeerSession({ id: 'p3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'p3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.attachDataChannel(old);
     // The attach happens right after the 49th entry leaves the old channel.
     const sendOld = old.send;

@@ -68,8 +68,6 @@ function normalizeRpcMethod(method: unknown): string {
   return String(method || '').trim().toLowerCase();
 }
 
-// Minimum interval between full TAPE_SUB tape re-reads per session (H3).
-const TAPE_SUB_MIN_INTERVAL_MS = 1000;
 // Bound on tracked per-client HTTP buckets (see KeyedTokenBuckets).
 const HTTP_BUCKET_TABLE_MAX = 5000;
 // Round 8: deadline and body cap for calls to the legacy relayer (its routes can answer large
@@ -303,9 +301,13 @@ async function main() {
   // sends forwarding headers: the usual sign of a proxy missing from TRUST_PROXY_CIDRS,
   // which makes every client share that proxy's HTTP bucket.
   const forwardedHeaderHintGate = new MinIntervalGate(10 * 60 * 1000, 1);
-  // One TAPE_SUB replay per client IP per second; sessions are cheap, so a
-  // per-session limit alone would let one IP multiply its replay rate.
-  const tapeResyncGate = new MinIntervalGate(TAPE_SUB_MIN_INTERVAL_MS, 5000);
+  // Open budget per client key, charged with each session's own open bucket (PeerSession.admitOpen).
+  // Covers SIGNAL_OFFER, channel opens and TAPE_SUB, so opening sessions does not multiply it.
+  const openClientBuckets = new KeyedTokenBuckets({
+    capacity: cfg.openIpBurst,
+    refillPerSec: cfg.openIpRatePerSec,
+    maxKeys: HTTP_BUCKET_TABLE_MAX,
+  });
 
   const pendingRpc = new Map<string, {
     wireId: string;
@@ -1226,7 +1228,16 @@ async function main() {
 
     const id = `peer-${randId()}`;
     const userAgent = req?.headers?.['user-agent'] ? String(req.headers['user-agent']) : undefined;
-    const sess = new PeerSession({ id, ws, burst: cfg.submitBurst, ratePerSec: cfg.submitRatePerSec, remoteIp: remoteIp || undefined, userAgent });
+    const sess = new PeerSession({
+      id,
+      ws,
+      burst: cfg.submitBurst,
+      ratePerSec: cfg.submitRatePerSec,
+      openBurst: cfg.openSessionBurst,
+      openRatePerSec: cfg.openSessionRatePerSec,
+      remoteIp: remoteIp || undefined,
+      userAgent,
+    });
     sessions.set(id, sess);
     peers.add(sess);
     perIpCounts.set(ipKey, (perIpCounts.get(ipKey) || 0) + 1);
@@ -1286,7 +1297,7 @@ async function main() {
 
         if (msg.t === 'SIGNAL_OFFER') {
           // Refused before anything is torn down, so a flood cannot close the live channel.
-          if (!sess.openBucket.allow(1)) {
+          if (!sess.admitOpen(openClientBuckets, ipKey)) {
             sendSignal({ t: 'SIGNAL_ERR', v: 1, code: 'rate_limited', msg: 'too many SIGNAL_OFFER' });
             return;
           }
@@ -1317,9 +1328,9 @@ async function main() {
 
           pc.ondatachannel = (ev: any) => {
             const dc: RTCDataChannel = ev.channel;
-            // Every channel open draws on the session's open budget, refused or adopted, so a peer that
+            // Every channel open draws on the open budget, refused or adopted, so a peer that
             // reopens channels in a loop is paced like one that sends offers.
-            if (!sess.openBucket.allow(1)) {
+            if (!sess.admitOpen(openClientBuckets, ipKey)) {
               refuseChannel(dc, { code: 'rate_limited', msg: 'too many channel opens; open again after a second' });
               return;
             }
@@ -1429,9 +1440,9 @@ async function main() {
                 }
 
                 if (wm.t === 'TAPE_SUB') {
-                  // H3c: rate-limit full tape re-reads per client IP (not per session). A refused
-                  // request does not subscribe the channel: live entries follow only a served TAPE_SUB.
-                  if (!tapeResyncGate.allow(ipKey)) {
+                  // A TAPE_SUB is an open (PeerSession.admitTapeSub). A refused request does not subscribe
+                  // the channel: live entries follow only a served TAPE_SUB.
+                  if (!sess.admitTapeSub(openClientBuckets, ipKey)) {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second' });
                     return;
                   }

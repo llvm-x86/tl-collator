@@ -367,7 +367,7 @@ test('admission: a trader key or order reference in upper-case hex names the sam
 
 test('submit: sessions of one client share one SUBMIT budget; another client is not affected', () => {
   const clients = new KeyedTokenBuckets({ capacity: 2, refillPerSec: 0.001, maxKeys: 100 });
-  const session = (id) => new PeerSession({ id, ws: {}, burst: 100, ratePerSec: 100, remoteIp: '198.51.100.7' });
+  const session = (id) => new PeerSession({ id, ws: {}, burst: 100, ratePerSec: 100, openBurst: 4, openRatePerSec: 3, remoteIp: '198.51.100.7' });
   const a = session('a');
   const b = session('b');
   assert.equal(a.admitSubmit(clients, 'ip:198.51.100.7'), true);

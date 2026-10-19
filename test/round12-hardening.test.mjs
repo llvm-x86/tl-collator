@@ -60,7 +60,7 @@ test('R12-F1 live entries committed during a paused replay follow the replay in 
     const store = openStore(dir, 300);
     const ch = fakeChannel();
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
-    const session = new PeerSession({ id: 'f1-order', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'f1-order', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     const served = session.serveTapeSub(ch, store, 1);
     // The replay is now parked on the full queue at seq 1.
@@ -85,7 +85,7 @@ test('R12-F1 a newer TAPE_SUB on the same session supersedes the replay still pa
     const store = openStore(dir, 300);
     const ch = fakeChannel();
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
-    const session = new PeerSession({ id: 'f1-supersede', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'f1-supersede', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     const first = session.serveTapeSub(ch, store, 1);
     await sleep(30);
@@ -107,7 +107,7 @@ test('R12-F1 live entries held past the bound close the channel and end the repl
     const store = openStore(dir, 20);
     const ch = fakeChannel();
     ch.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
-    const session = new PeerSession({ id: 'f1-held', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    const session = new PeerSession({ id: 'f1-held', ws: { readyState: 1 }, burst: 10, ratePerSec: 1, openBurst: 4, openRatePerSec: 3 });
     session.dc = ch;
     const served = session.serveTapeSub(ch, store, 1);
     await sleep(30);

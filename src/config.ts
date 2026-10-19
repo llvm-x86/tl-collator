@@ -25,6 +25,10 @@ export interface Config {
   submitRatePerSec: number;
   submitClientBurst: number;
   submitClientRatePerSec: number;
+  openSessionBurst: number;
+  openSessionRatePerSec: number;
+  openIpBurst: number;
+  openIpRatePerSec: number;
   clearlistEnforce: boolean;
   clearlistUrl: string | null;
   clearlistFailMode: 'open' | 'closed';
@@ -196,6 +200,21 @@ export function loadConfig(): Config {
   // Concurrency caps: 0 disables. (Parsed here, not with `|| default`, which would
   // turn an explicit 0 back into the default.)
   const connMaxPerIp = intEnv('CONN_MAX_PER_IP', 16, atLeast(0));
+  // Admission budget for opens (SIGNAL_OFFER and each channel open) and TAPE_SUB. Each costs one unit,
+  // drawn from the session's bucket and then from its client IP's bucket. Refill is per second.
+  // The IP scope is sized for N = 8 honest tabs behind one NAT: an honest reconnect is an offer, a
+  // channel and a TAPE_SUB (3 units), so one session reconnecting once a second needs 3 per second,
+  // and 8 such tabs need 8 x 3 = 24 per second with a burst of 8 x 4 = 32.
+  //
+  //   scope    burst (env, default)     refill per second (env, default)
+  //   session  OPEN_SESSION_BURST (4)   OPEN_SESSION_RPS (3)
+  //   client   OPEN_IP_BURST (32)       OPEN_IP_RPS (24)
+  //
+  // A second TAPE_SUB on one session inside 1 s is refused whatever the budget (TAPE_SUB_MIN_INTERVAL_MS).
+  const openSessionBurst = intEnv('OPEN_SESSION_BURST', 4, atLeast(1));
+  const openSessionRatePerSec = intEnv('OPEN_SESSION_RPS', 3, atLeast(1));
+  const openIpBurst = intEnv('OPEN_IP_BURST', 32, atLeast(1));
+  const openIpRatePerSec = intEnv('OPEN_IP_RPS', 24, atLeast(1));
   // Hard cap on concurrent in-flight routed RPC requests.
   const pendingRpcMax = intEnv('PENDING_RPC_MAX', 1000, atLeast(1));
   const rpcAdvertTtlMs = intEnv('TL_COLLATOR_RPC_ADVERT_TTL_MS', 45000, atLeast(15000, TIMER_MAX_MS));
@@ -223,6 +242,10 @@ export function loadConfig(): Config {
     submitRatePerSec,
     submitClientBurst,
     submitClientRatePerSec,
+    openSessionBurst,
+    openSessionRatePerSec,
+    openIpBurst,
+    openIpRatePerSec,
     clearlistEnforce,
     clearlistUrl,
     clearlistFailMode,
