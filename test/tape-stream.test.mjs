@@ -253,6 +253,29 @@ test('R13-2 a channel attached while a replay is in flight is refused with ERR b
   }
 });
 
+test('R17-F3 the busy_retry answer tells the peer to wait 1 s before its TAPE_SUB, the interval the TAPE_SUB gate charges', { timeout: 20000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r17-busy-'));
+  try {
+    const store = openStore(dir);
+    for (let i = 1; i <= 20; i += 1) store.append(orderFor(i));
+    const a = makeChannel();
+    a.bufferedAmount = 2 * DC_REPLAY_HIGH_WATER_BYTES;
+    const session = new PeerSession({ id: 'r17-3', ws: { readyState: 1 }, burst: 10, ratePerSec: 1 });
+    session.attachDataChannel(a);
+    const served = session.serveTapeSub(a, store, 1);
+    await sleep(20);
+    const b = makeChannel();
+    assert.equal(session.attachDataChannel(b), false);
+    a.bufferedAmount = 0;
+    await served;
+    const refusals = b.msgs.filter((m) => m.t === 'ERR');
+    assert.deepEqual(refusals.map((m) => m.code), ['busy_retry']);
+    assert.match(refusals[0].msg, /TAPE_SUB at least 1 s after this message/, 'the busy_retry answer does not say how long to wait');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('R13-4 a replay past its deadline ends with the channel closed and no TAPE_END', { timeout: 20000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tl-r13-deadline-'));
   try {

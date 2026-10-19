@@ -153,7 +153,7 @@ export class PeerSession {
    */
   attachDataChannel(dc: RTCDataChannel): boolean {
     if (this.stream !== null) {
-      refuseChannel(dc, { code: 'busy_retry', msg: 'a replay is in flight on this connection; open the channel again when it ends' });
+      refuseChannel(dc, { code: 'busy_retry', msg: 'a replay is in flight on this connection; open the channel again when it ends, and send its TAPE_SUB at least 1 s after this message' });
       return false;
     }
     const previous = this.dc;
