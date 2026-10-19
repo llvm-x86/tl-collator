@@ -66,17 +66,10 @@ export function findCanonicalViolation(v: unknown): string | null {
 }
 
 // JSON.parse keeps a number's value, not its text, and rounds: "9007199254740991.0000000000000001"
-// parses to the integer 9007199254740991. The reviver's source text (Node 21+) lets the number be
-// judged as written. A runtime without it would judge nothing, so it is refused at load.
-const JSON_SOURCE_TEXT: boolean = (() => {
-  let seen = false;
-  JSON.parse('1', (_key, value, context?: { source?: string }) => {
-    seen = typeof context?.source === 'string';
-    return value;
-  });
-  return seen;
-})();
-if (!JSON_SOURCE_TEXT) throw new Error('TL-Canon needs JSON number source text (Node 21 or later)');
+// parses to the integer 9007199254740991. So the number tokens are judged on their text before parsing,
+// which needs no runtime support beyond JSON.parse. The pattern consumes whole strings first, so digits
+// inside a string are never read as numbers.
+const JSON_TOKEN = /"(?:[^"\\\u0000-\u001f]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
 
 /** The integer a JSON number token denotes, or null when its exact value is not an integer. */
 function exactInteger(token: string): bigint | null {
@@ -98,19 +91,23 @@ function exactInteger(token: string): bigint | null {
   return BigInt(sign + digits);
 }
 
+/** True when a number token's value is a safe integer that its text does not write as that integer. */
+function hidesItsFraction(token: string): boolean {
+  const value = Number(token);
+  return Number.isSafeInteger(value) && exactInteger(token) !== BigInt(value);
+}
+
 /**
  * Parses JSON text as TL-Canon input. Returns null for text that is not JSON, or that holds a safe
  * integer not written as that integer (the value is 9007199254740991 but the text is a fraction).
  * Other numbers are left to findCanonicalViolation, which refuses any that is not a safe integer.
  */
 export function parseCanonicalJson(text: string): unknown {
+  for (const [token] of text.matchAll(JSON_TOKEN)) {
+    if (token[0] !== '"' && hidesItsFraction(token)) return null;
+  }
   try {
-    return JSON.parse(text, (_key, value, context?: { source?: string }) => {
-      if (typeof value === 'number' && Number.isSafeInteger(value) && exactInteger(context?.source ?? '') !== BigInt(value)) {
-        throw new SyntaxError('number is not written as the integer its value shows');
-      }
-      return value;
-    });
+    return JSON.parse(text);
   } catch {
     return null;
   }
