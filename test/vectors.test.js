@@ -204,6 +204,17 @@ test('TL-Canon text: a safe integer written as a fraction is refused at parse; t
   }
 });
 
+test('TL-Canon text: a hostile text that opens a string and never closes it is refused in linear time', () => {
+  // A string opener followed by escaped quotes made a pattern scan quadratic: 28 s at 256 KiB.
+  const hostile = '"' + '\\"'.repeat(131072);
+  const started = process.hrtime.bigint();
+  assert.equal(parseCanonicalJson(hostile), null);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert(elapsedMs < 1000, `a 256 KiB unterminated string took ${elapsedMs.toFixed(0)} ms`);
+  // The same bytes inside a closed string are valid JSON and still parse.
+  assert.notEqual(parseCanonicalJson(JSON.stringify({ a: '\\"'.repeat(1000) })), null);
+});
+
 test('TL-Canon round trip: the canonical text parses back to the same value and re-encodes byte-identically', () => {
   for (const v of [vectors.integerKeyTest.input, vectors.unicodeKeyOrderTest.input, vectors.integralNumberTest.input, vectors.orderIntegerKeyTest.envelopeNoSig]) {
     const text = stableStringify(v);

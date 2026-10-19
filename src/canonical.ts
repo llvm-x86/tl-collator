@@ -103,14 +103,19 @@ function hidesItsFraction(token: string): boolean {
  * Other numbers are left to findCanonicalViolation, which refuses any that is not a safe integer.
  */
 export function parseCanonicalJson(text: string): unknown {
-  for (const [token] of text.matchAll(JSON_TOKEN)) {
-    if (token[0] !== '"' && hidesItsFraction(token)) return null;
-  }
+  // Parse first: JSON.parse is linear and refuses a text with an unterminated string, so the scan below
+  // only ever sees complete strings and runs in linear time. Scanning first is quadratic on a hostile
+  // text that opens a string and never closes it.
+  let value: unknown;
   try {
-    return JSON.parse(text);
+    value = JSON.parse(text);
   } catch {
     return null;
   }
+  for (const [token] of text.matchAll(JSON_TOKEN)) {
+    if (token[0] !== '"' && hidesItsFraction(token)) return null;
+  }
+  return value;
 }
 
 // TL-Canon v1 key order: ascending Unicode **code point** (shortest prefix
