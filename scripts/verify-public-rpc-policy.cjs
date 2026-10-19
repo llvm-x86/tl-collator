@@ -42,10 +42,14 @@ const peerSessionSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 's
 const configSrc = codeOnly(fs.readFileSync(path.resolve(__dirname, '..', 'src', 'config.ts'), 'utf8'));
 const schemaSrc = codeOnly(fs.readFileSync(schemaPath, 'utf8'));
 const orderSchema = fs.readFileSync(orderSchemaPath, 'utf8');
-if (!fs.existsSync(relayerPath)) {
+// The relayer comparison needs the sibling checkout. Without it only the collator's own policy is
+// checked, so `npm test` works in a lone clone; TL_REQUIRE_RELAYER=1 makes a missing sibling an error.
+const relayerFound = fs.existsSync(relayerPath);
+if (!relayerFound && process.env.TL_REQUIRE_RELAYER === '1') {
   throw new Error(`relayer RPC route source not found: ${relayerPath} (set TL_RELAYER_RPC_ROUTE_SOURCE)`);
 }
-const relayer = codeOnly(fs.readFileSync(relayerPath, 'utf8'));
+if (!relayerFound) console.warn(`verify-public-rpc-policy: relayer source not found at ${relayerPath}; relayer comparison skipped`);
+const relayer = relayerFound ? codeOnly(fs.readFileSync(relayerPath, 'utf8')) : null;
 
 function methodsFrom(source, name) {
   const block = source.match(new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`));
@@ -54,7 +58,7 @@ function methodsFrom(source, name) {
 }
 
 const collatorMethods = methodsFrom(collator, 'PUBLIC_RPC_METHODS');
-const relayerMethods = methodsFrom(relayer, 'PUBLIC_RPC_METHODS');
+const relayerMethods = relayer ? methodsFrom(relayer, 'PUBLIC_RPC_METHODS') : null;
 const required = [
   'tl_getstatesnapshot',
   'tl_getsyncstatus',
@@ -73,11 +77,11 @@ const prohibited = /(?:sign|privatekey|dumpprivkey|importprivkey|walletpassphras
 // fall through to the WebRTC-routed path, and the README documents that.
 const readOnlyCompat = ['getblockchaininfo', 'validateaddress', 'listunspent', 'decoderawtransaction'];
 
-for (const method of [...collatorMethods, ...relayerMethods]) {
+for (const method of [...collatorMethods, ...(relayerMethods || [])]) {
   if (prohibited.test(method)) throw new Error(`Prohibited public RPC method: ${method}`);
 }
 for (const method of required) {
-  if (!collatorMethods.includes(method) || !relayerMethods.includes(method)) {
+  if (!collatorMethods.includes(method) || (relayerMethods && !relayerMethods.includes(method))) {
     throw new Error(`Required public method missing: ${method}`);
   }
 }
@@ -301,14 +305,14 @@ for (const needle of [
   "'tl_watchonly_register'",
   "'tl_watchonly_utxos'",
 ]) {
-  if (!relayer.includes(needle)) throw new Error(`Relayer policy missing: ${needle}`);
+  if (relayer && !relayer.includes(needle)) throw new Error(`Relayer policy missing: ${needle}`);
 }
 
 console.log(JSON.stringify({
   ok: true,
   collatorMethodCount: collatorMethods.length,
-  relayerMethodCount: relayerMethods.length,
-  collatorOnlyMethods: collatorMethods.filter((method) => !relayerMethods.includes(method)),
+  relayerMethodCount: relayerMethods ? relayerMethods.length : null,
+  collatorOnlyMethods: relayerMethods ? collatorMethods.filter((method) => !relayerMethods.includes(method)) : null,
   required,
   readOnlyCompat,
 }, null, 2));
