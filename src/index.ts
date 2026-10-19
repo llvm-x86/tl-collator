@@ -309,6 +309,13 @@ async function main() {
     maxKeys: HTTP_BUCKET_TABLE_MAX,
   });
 
+  // Replays per client key: a TAPE_SUB starts a replay of up to the replay bound, so it is also charged here.
+  const tapeClientBuckets = new KeyedTokenBuckets({
+    capacity: cfg.tapeIpBurst,
+    refillPerSec: cfg.tapeIpRatePerSec,
+    maxKeys: HTTP_BUCKET_TABLE_MAX,
+  });
+
   const pendingRpc = new Map<string, {
     wireId: string;
     requester?: PeerSession;
@@ -1442,7 +1449,7 @@ async function main() {
                 if (wm.t === 'TAPE_SUB') {
                   // A TAPE_SUB is an open (PeerSession.admitTapeSub). A refused request does not subscribe
                   // the channel: live entries follow only a served TAPE_SUB.
-                  if (!sess.admitTapeSub(openClientBuckets, ipKey)) {
+                  if (!sess.admitTapeSub(openClientBuckets, tapeClientBuckets, ipKey)) {
                     sess.sendDc({ t: 'ERR', v: 1, code: 'rate_limited', msg: 'TAPE_SUB resync too frequent; resubscribe after a second' });
                     return;
                   }

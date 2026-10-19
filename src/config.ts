@@ -29,6 +29,8 @@ export interface Config {
   openSessionRatePerSec: number;
   openIpBurst: number;
   openIpRatePerSec: number;
+  tapeIpBurst: number;
+  tapeIpRatePerSec: number;
   clearlistEnforce: boolean;
   clearlistUrl: string | null;
   clearlistFailMode: 'open' | 'closed';
@@ -215,6 +217,12 @@ export function loadConfig(): Config {
   const openSessionRatePerSec = intEnv('OPEN_SESSION_RPS', 3, atLeast(1));
   const openIpBurst = intEnv('OPEN_IP_BURST', 32, atLeast(1));
   const openIpRatePerSec = intEnv('OPEN_IP_RPS', 24, atLeast(1));
+  // A TAPE_SUB also starts a replay of up to the replay bound, so it draws on a second, smaller client bucket:
+  // N = 8 honest tabs each resubscribing once a second need 8 per second.
+  //
+  //   client   TAPE_IP_BURST (16)       TAPE_IP_RPS (8)
+  const tapeIpBurst = intEnv('TAPE_IP_BURST', 16, atLeast(1));
+  const tapeIpRatePerSec = intEnv('TAPE_IP_RPS', 8, atLeast(1));
   // Hard cap on concurrent in-flight routed RPC requests.
   const pendingRpcMax = intEnv('PENDING_RPC_MAX', 1000, atLeast(1));
   const rpcAdvertTtlMs = intEnv('TL_COLLATOR_RPC_ADVERT_TTL_MS', 45000, atLeast(15000, TIMER_MAX_MS));
@@ -245,6 +253,8 @@ export function loadConfig(): Config {
     openSessionBurst,
     openSessionRatePerSec,
     openIpBurst,
+    tapeIpBurst,
+    tapeIpRatePerSec,
     openIpRatePerSec,
     clearlistEnforce,
     clearlistUrl,

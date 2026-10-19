@@ -363,6 +363,20 @@ test('admission: a trader key or order reference in upper-case hex names the sam
   }
 });
 
+// ---------------------------------------------------------------- TAPE_SUB replay cost
+
+test('tape: sessions behind one client share one replay budget; another client is not affected', () => {
+  // Generous open budgets, so only the replay bucket can refuse. Each session asks once.
+  const opens = new KeyedTokenBuckets({ capacity: 1000, refillPerSec: 1000, maxKeys: 100 });
+  const tape = new KeyedTokenBuckets({ capacity: 4, refillPerSec: 0.001, maxKeys: 100 });
+  const session = (id) => new PeerSession({ id, ws: {}, burst: 100, ratePerSec: 100, openBurst: 100, openRatePerSec: 100, remoteIp: '198.51.100.7' });
+  const key = 'ip:198.51.100.7';
+  let admitted = 0;
+  for (let i = 0; i < 16; i++) if (session(`s${i}`).admitTapeSub(opens, tape, key)) admitted++;
+  assert.equal(admitted, 4, `16 sessions of one client started ${admitted} replays; the client bucket allows 4`);
+  assert.equal(session('other').admitTapeSub(opens, tape, 'ip:203.0.113.9'), true, 'another client was refused');
+});
+
 // ---------------------------------------------------------------- SUBMIT rate
 
 test('submit: sessions of one client share one SUBMIT budget; another client is not affected', () => {

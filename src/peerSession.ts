@@ -170,12 +170,15 @@ export class PeerSession {
   /**
    * Admits a TAPE_SUB as an open, and also refuses one that comes less than TAPE_SUB_MIN_INTERVAL_MS after
    * this session's last served TAPE_SUB, whatever the budget holds: a token bucket alone would admit a
-   * second TAPE_SUB on a session that has tokens left. A request refused by the spacing charges nothing.
+   * second TAPE_SUB on a session that has tokens left. A request refused by the spacing charges nothing. The
+   * client's TAPE_SUBs also draw on tapeClients, so sessions behind one IP cannot start replays faster than that bucket.
    */
-  admitTapeSub(clients: KeyedTokenBuckets, clientKey: string): boolean {
+  admitTapeSub(clients: KeyedTokenBuckets, tapeClients: KeyedTokenBuckets, clientKey: string): boolean {
     const now = Date.now();
     if (now - this.lastTapeSubMs < TAPE_SUB_MIN_INTERVAL_MS) return false;
     if (!this.admitOpen(clients, clientKey)) return false;
+    // A replay costs more than an open, so the client's replays are bounded by their own bucket.
+    if (!tapeClients.take(clientKey).allowed) return false;
     this.lastTapeSubMs = now;
     return true;
   }
