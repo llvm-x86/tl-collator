@@ -438,6 +438,23 @@ test('signal: SIGNAL_OFFER is paced per session; a flood is answered rate_limite
   }
 });
 
+test('R17-F2 channel opens draw on the session budget: opens past it are refused rate_limited, each with one ERR and a close', { timeout: 60000 }, async () => {
+  const c = await startCollator({ TL_E2E_WRTC: 'fake' });
+  try {
+    // The offer and the first channel take two of the budget's three tokens.
+    const peer = await openDataPeer(c.port);
+    for (let i = 0; i < 20; i += 1) {
+      peer.ws.send(JSON.stringify({ t: 'SIGNAL_ICE', v: 1, candidate: { candidate: 'open' } }));
+    }
+    await new Promise((r) => setTimeout(r, 500));
+    const refused = peer.wire.filter((m) => m.t === 'ERR');
+    assert.ok(refused.length >= 15, `only ${refused.length} of 20 channel opens were refused`);
+    assert.ok(refused.every((m) => m.code === 'rate_limited'), `refusals were ${refused.map((m) => m.code)}`);
+  } finally {
+    await c.stop();
+  }
+});
+
 // A DataChannel peer over the real signalling socket. The collator's channel is the fake from
 // scripts/e2e/wrtc-fake.mjs (TL_E2E_WRTC=fake): `wire` is what the collator sent on it, `send` is
 // what the peer sends, and `closed` is set when the collator closes the channel.

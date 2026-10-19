@@ -11,7 +11,7 @@ import { loadConfig } from './config.js';
 import type { RpcRequestV1, RpcResponseV1, RpcServiceAdvertisementV1, SignalMsg, WireMsg } from './types.js';
 import { ensurePrivKeyHex, pubKeyFromPrivKeyHex, sha256Hex } from './crypto.js';
 import { TapeStore } from './tape.js';
-import { PeerSession, broadcastTapeEntry, dcMessageBytes } from './peerSession.js';
+import { PeerSession, broadcastTapeEntry, dcMessageBytes, refuseChannel } from './peerSession.js';
 import { fetchBoundedJson } from './boundedFetch.js';
 import { attachRequestDeadlines } from './httpDeadlines.js';
 import { isWireMsg } from './validate.js';
@@ -1286,7 +1286,7 @@ async function main() {
 
         if (msg.t === 'SIGNAL_OFFER') {
           // Refused before anything is torn down, so a flood cannot close the live channel.
-          if (!sess.offerBucket.allow(1)) {
+          if (!sess.openBucket.allow(1)) {
             sendSignal({ t: 'SIGNAL_ERR', v: 1, code: 'rate_limited', msg: 'too many SIGNAL_OFFER' });
             return;
           }
@@ -1317,6 +1317,12 @@ async function main() {
 
           pc.ondatachannel = (ev: any) => {
             const dc: RTCDataChannel = ev.channel;
+            // Every channel open draws on the session's open budget, refused or adopted, so a peer that
+            // reopens channels in a loop is paced like one that sends offers.
+            if (!sess.openBucket.allow(1)) {
+              refuseChannel(dc, { code: 'rate_limited', msg: 'too many channel opens; open again after a second' });
+              return;
+            }
             // Round 8: one live channel per session; the one it replaces is closed. A channel opened
             // during a replay is refused (see PeerSession.attachDataChannel).
             if (!sess.attachDataChannel(dc)) return;

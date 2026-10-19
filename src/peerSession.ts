@@ -71,8 +71,8 @@ interface TapeStream {
 const entryBytes = (entry: TapeEntryV1): number => dcMessageBytes(JSON.stringify(entry));
 
 /** Why the collator closes a tape channel. The code is stable: the peer reads it to tell a resync from a dead channel. */
-interface CloseReason {
-  code: 'resync_required' | 'stalled' | 'deadline_exceeded' | 'busy_retry';
+export interface CloseReason {
+  code: 'resync_required' | 'stalled' | 'deadline_exceeded' | 'busy_retry' | 'rate_limited';
   msg: string;
 }
 
@@ -84,6 +84,14 @@ function sendErrOn(channel: RTCDataChannel, reason: CloseReason): void {
   if (channel.readyState !== 'open') return;
   try {
     channel.send(JSON.stringify({ t: 'ERR', v: 1, code: reason.code, msg: reason.msg }));
+  } catch {}
+}
+
+/** Refuses a channel the collator will not adopt: the stated ERR, then the close. */
+export function refuseChannel(channel: RTCDataChannel, reason: CloseReason): void {
+  sendErrOn(channel, reason);
+  try {
+    channel.close();
   } catch {}
 }
 
@@ -107,9 +115,10 @@ export class PeerSession {
   // SUBMIT rate limit (per-peer).
   submitBucket: TokenBucket;
 
-  // SIGNAL_OFFER pacing. Each accepted offer builds a native peer connection, and one connection
-  // needs one offer, so a small burst covers reconnects and the rest is refused.
-  offerBucket: TokenBucket = new TokenBucket({ capacity: 3, refillPerSec: 1 });
+  // Pacing for native objects a peer can make the collator build: each accepted SIGNAL_OFFER builds a
+  // peer connection, and each channel open (adopted or refused) builds a channel. One budget for both,
+  // so a small burst covers a reconnect and the rest is refused.
+  openBucket: TokenBucket = new TokenBucket({ capacity: 3, refillPerSec: 1 });
 
   meta: SessionMetaV1;
 
@@ -144,10 +153,7 @@ export class PeerSession {
    */
   attachDataChannel(dc: RTCDataChannel): boolean {
     if (this.stream !== null) {
-      sendErrOn(dc, { code: 'busy_retry', msg: 'a replay is in flight on this connection; open the channel again when it ends' });
-      try {
-        dc.close();
-      } catch {}
+      refuseChannel(dc, { code: 'busy_retry', msg: 'a replay is in flight on this connection; open the channel again when it ends' });
       return false;
     }
     const previous = this.dc;

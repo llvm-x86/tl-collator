@@ -10,6 +10,11 @@ class FakeRTCPeerConnection {
   }
 
   async setRemoteDescription() {
+    this.openChannel();
+  }
+
+  // Opens one more channel on this connection, as a peer does when it opens its channel again.
+  openChannel() {
     const pc = this;
     this.channel = {
       readyState: 'open',
@@ -37,6 +42,10 @@ class FakeRTCPeerConnection {
 
   async addIceCandidate(candidate) {
     const text = candidate?.candidate ?? '';
+    if (text === 'open') {
+      this.openChannel();
+      return;
+    }
     if (text.startsWith('in:') && this.channel?.readyState === 'open') {
       this.channel.onmessage({ data: text.slice(3) });
     }
